@@ -52,9 +52,11 @@
 ## Contributions by:
 ##          Martin Leung <ccmartin@ust.hk>
 
+use strict;
+
 package OpenCA::OpenSSL;
 
-$VERSION = '0.4.51';
+$OpenCA::OpenSSL::VERSION = '0.6.3a';
 
 ## Global Variables Go HERE
 my %params = (
@@ -82,7 +84,7 @@ sub new {
 	$self->setParams( @_ );
 
 	if( not $self->{binDir} ) {
-		$self->{binDir} = "/usr/local/ssl/bin";
+		$self->{binDir} = "/usr/bin";
 	};
 
         if( not $self->{shell} ) {
@@ -113,6 +115,7 @@ sub setParams {
 
 	my $self = shift;
 	my $params = { @_ };
+	my $key;
 
 	foreach $key ( keys %{$params} ) {
 
@@ -143,6 +146,11 @@ sub genKey {
 
 	my $command = "$self->{shell} genrsa ";
 
+	if( $passwd ) {
+		$command .= "-passout env:pwd ";
+		$alg = "des" if ( $alg eq "" );
+	}
+
 	if ( $alg ne "" ) {
 		$command .= "-$alg ";
 	}
@@ -153,13 +161,19 @@ sub genKey {
 
 	$command .= $bits;
 
+	$ENV{'pwd'} = $passwd;
+
 	open(FD, "|$command" ) || return;
 		## Send Password
-		print FD "$passwd\n";
+		## if( $passwd ) {
+		## 	print FD "$passwd\n";
+		## }
 
 		## Send Confirmation Password
-		print FD "$passwd\n";
+		## print FD "$passwd\n";
 	close(FD);
+
+	$ENV{'pwd'} = "";
 
 	if( $? != 0 ) {
 		return;
@@ -184,13 +198,15 @@ sub genReq {
 	my @DN      = @{ $keys->{DN} };
 	my $command = "$self->{shell} req -new ";
 	my $tmpfile = $self->{tmpDir} . "/${$}_req.pem";
-	my $ret;
+	my ( $ret, $tmp );
 
 	return if( not $keyfile );
 
 	if ( $self->{cnf} ne "" ) {
 		$command .= "-config " . $self->{cnf} . " ";
 	}
+
+	$command .= "-passin env:pwd " if ( $passwd ne "" );
 
 	$outform = uc( $outform );
 	if ( $outform =~ /(PEM|DER)/i ) {
@@ -207,16 +223,20 @@ sub genReq {
 	
 	$command .= "-key $keyfile ";
 
+	$ENV{'pwd'} = $passwd;
+
 	open( FD, "|$command" ) or return ;
-		if( $passwd ne "" ) {
-			print FD "$passwd\n";
-		}
+		## if( $passwd ne "" ) {
+		## 	print FD "$passwd\n";
+		## }
 
 		foreach $tmp (@DN) {
 			print FD "$tmp\n";
 		}
 
 	close(FD);
+
+	$ENV{'pwd'} = "";
 
 	if( $? != 0 ) {
 		return;
@@ -245,7 +265,6 @@ sub genCert {
 
 	my $self = shift;
 	my $keys = { @_ };
-	my $ret = "";
 
 	my $outfile = $keys->{OUTFILE};
 	my $keyfile = $keys->{KEYFILE};
@@ -256,8 +275,11 @@ sub genCert {
 
 	my $command = "$self->{shell} req -x509 ";
 
+	my ( $ret, $tmp );
+
 	return if( (not $keyfile) or (not $reqfile) );
 
+	$command .= "-passin env:pwd " if ( $passwd ne "" );
 	$command .= "-config ". $self->{cnf} . " " if ( $self->{cnf} ne "" );
 	$command .= "-days $days " if ( $days > 0 );
 
@@ -269,9 +291,11 @@ sub genCert {
 		$command .= "-out \"$tmpfile\" ";
 	}
 
+	$ENV{'pwd'} = $passwd;
 	open( FD, "|$command" ) || return ;
-		print FD "$passwd\n";
+		## print FD "$passwd\n";
 	close(FD);
+	$ENV{'pwd'} = "";
 
 	if( $? != 0 ) {
 		return;
@@ -311,7 +335,7 @@ sub dataConvert {
 	my $outfile = $keys->{OUTFILE};
 	my $infile  = $keys->{INFILE};
 
-	my $ret, $tmpfile;
+	my ( $ret, $tmpfile );
 
 	return if( not $type);
 	return if( (not $data) and (not $infile));
@@ -352,7 +376,7 @@ sub dataConvert {
 	}
 
 	if( $infile ne "" ) {
-		$ret=`$command`;
+		$ret=`$command 2>&1`;
 		## return if ( $? != 0 );
 	} else {
 		if( $outfile eq "" ) {
@@ -368,7 +392,7 @@ sub dataConvert {
 
 		## return if( $? != 0 );
 
-		open( TMP, "$tmpfile" ) or return;
+		open( TMP, "<$tmpfile" ) or return;
 			my $tmp;
 			$ret = "";
 
@@ -410,14 +434,14 @@ sub issueCert {
 	my $cakey    = $keys->{CAKEY};
 	my $cacert   = $keys->{CACERT};
 	my $days     = $keys->{DAYS};
-	my $starDate = $keys->{START_DATE};
+	my $startDate= $keys->{START_DATE};
 	my $endDate  = $keys->{END_DATE};
 	my $passwd   = $keys->{PASSWD};
 	my $exts     = $keys->{EXTS};
 	my $reqtype  = $keys->{REQTYPE};
 	my $caName   = $keys->{CA_NAME};
 	
-	my $ret, $tmpfile;
+	my ( $ret, $tmpfile );
 
 	return if( (not $reqdata) and (not $reqfile));
 
@@ -469,6 +493,45 @@ sub issueCert {
 	return 1;
 }
 
+sub revoke {
+
+	## CAKEY  => $CAkeyfile (Optional)
+	## CACERT => $CAcertfile (Optional)
+	## PASSWD => $passwd (Optional - if not needed)
+	## INFILE => $certFile (PEM Formatted certificate file);
+
+	my $self = shift;
+	my $keys = { @_ };
+
+	my $cakey    = $keys->{CAKEY};
+	my $cacert   = $keys->{CACERT};
+	my $passwd   = $keys->{PASSWD};
+	my $certFile = $keys->{INFILE};
+
+	my ( $tmp, $ret );
+	my $command = "$self->{shell} ca -revoke \"$certFile\" ";
+
+	return if (not $certFile);
+
+	$command .= "-config " . $self->{cnf}. " " if ( $self->{cnf} ne "" );
+	$command .= "-keyfile $cakey " if( $cakey ne "" );
+	$command .= "-key $passwd " if ( $passwd ne "" );
+	$command .= "-cert $cacert " if ( $cacert ne "" );
+
+	open( FD, "$command|" ) || return;
+		while( $tmp = <FD> ) {
+			$ret .= $tmp;
+		}
+	close(FD);
+
+	if( $? != 0) {
+		return;
+	} else {
+		return 1;
+	}
+}
+
+
 sub issueCrl {
 
 	## CAKEY   => $CAkeyfile
@@ -490,7 +553,7 @@ sub issueCrl {
 	my $outform  = $keys->{OUTFORM};
 	my $exts     = $keys->{EXTS};
 	
-	my $ret;
+	my ( $ret, $tmpfile );
 	my $command = "$self->{shell} ca -gencrl ";
 
 	if ( $outfile eq "" ){
@@ -523,7 +586,7 @@ sub issueCrl {
 
 		$ret = $self->dataConvert( INFILE  =>$tmp,
 					   OUTFORM =>$outform,
-					   DATATYPE=>CRL );
+					   DATATYPE=>"CRL" );
 		return if( not $ret );
 
 
@@ -621,6 +684,8 @@ sub getDigest {
 	my $alg     = lc( $keys->{ALGORITHM} );
 	my $tmpfile = $self->{tmpDir} . "/${$}_dgst.tmp";
 
+	my ( $command, $ret );
+
 	$alg = "md5" if( not $alg );
 
 	return if (not $data);
@@ -660,6 +725,8 @@ sub verify {
 	my $noChain = $keys->{NOCHAIN};
 	my $tmpfile = $self->{tmpDir} . "/${$}_vrfy.tmp";
 	my $command = $self->{verify} . " ";
+
+	my ( $ret );
 
 	$command   .= "-verbose " if ( $verbose );
 	$command   .= "-in $sigfile " if ($sigfile);
@@ -721,6 +788,8 @@ sub sign {
 	my $tmpfile = $self->{tmpDir} . "/${$}_sign.tmp";
 	my $command = $self->{sign} . " ";
 
+	my ( $ret );
+
 	return if( (not $data) and (not $datafile));
 	return if( (not $cert) or (not $key));
 
@@ -768,6 +837,52 @@ sub sign {
 	return $ret;
 }
 
+sub getCertAttribute {
+	my $self = shift;
+	my $keys = { @_ };
+
+	my $cert 	= ( $keys->{DATA} or $keys->{FILE} );
+	my $inform 	= ( $keys->{INFORM} or "PEM" );
+
+	my $attribute 	= lc( $keys->{ATTRIBUTE} );
+	my $cmd 	= "$self->{shell} x509 -noout ";
+
+	my ( $ret );
+
+	my $tmpfile = $self->{tmpDir} . "/${$}_ATTRIBUTE.tmp";
+
+	if( exists $keys->{FILE} ) {
+		$cmd .= "-in \"$cert\" ";
+	} elsif ( exists $keys->{DATA} ) {
+		$cmd .= "-in \"$tmpfile\" ";
+		open ( FD, ">$tmpfile" ) or return;
+			print FD "$cert";
+		close( FD );
+	} else {
+		return;
+	}
+
+	$attribute = "startdate" if( uc ($attribute) eq "NOTBEFORE" );
+	$attribute = "enddate" if( uc ($attribute) eq "NOTAFTER" );
+	$attribute = "subject" if( uc ($attribute) eq "DN" );
+	$attribute = "pubkey" if( uc ($attribute) eq "KEY" );
+
+	$cmd .= "-$attribute " if (exists $keys->{ATTRIBUTE} );
+	$ret = `$cmd`;
+
+	unlink( $tmpfile );
+
+	if ( $? != 0 ) {
+		return;
+	} else {
+		$ret =~ s/\S+\=\s*//;
+		$ret =~ s/$(\n|\r)//;
+
+		return $ret;
+	}
+
+}
+
 # Autoload methods go after =cut, and are processed by the autosplit program.
 
 1;
@@ -800,6 +915,9 @@ parameter should be passed to the function like this:
 
 	This functions creates a new instance of the class. It accepts
 	only one parameter: the path to the backend command (openssl).
+	This is due because if it cannot find the openssl command it
+	will return an uninitialized class (default value is /usr/bin/
+	openssl which may not fit many distributions/OSs)
 
 	EXAMPLE:
 
@@ -939,6 +1057,24 @@ parameter should be passed to the function like this:
 			CACERT=>$ca/cacert.pem,
 			PASSWD=>$passwd,
 			REQTYPE=>NETSCAPE );
+
+=head2 sub revoke () - Revoke a certificate.
+
+	This function is used to revoke a certificate. Accepted parameters
+	are:
+
+		CAKEY   - CA private key file(*);
+		CACERT  - CA certificate file(*);
+		PASSWD  - Password to decrypt priv. CA key(*);
+		INFILE  - Input PEM formatted certificate filename(*);
+
+	(*) - Optional parameters;
+
+	EXAMPLE:
+
+		if( not $openssl->revoke( INFILE=>$certFile ) ) {
+			print "Error while revoking certificate!";
+		}
 
 =head2 sub issueCrl () - Issue a CRL.
 

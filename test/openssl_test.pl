@@ -3,24 +3,24 @@
 $|=1;
 
 use OpenCA::OpenSSL;
-my $openssl = new OpenCA::OpenSSL;
+my $openssl = new OpenCA::OpenSSL( SHELL=>"/usr/bin/openssl" );
 
-$openssl->setParams ( SHELL=>"/usr/local/ssl/bin/openssl",
+$openssl->setParams ( SHELL=>"/usr/bin/openssl",
 		      CONFIG=>"/usr/local/OpenCA/stuff/openssl.cnf",
-		      VERIFY=>"/usr/local/ssl/bin/verify",
-		      SIGN=>"/usr/local/ssl/bin/sign" );
+		      VERIFY=>"/usr/bin/verify",
+		      SIGN=>"/usr/bin/sign" );
 
-$openssl->setParams ( STDERR => "/dev/null" );
+## $openssl->setParams ( STDERR => "/dev/null" );
 
-if( not $openssl->genKey( BITS=>512, OUTFILE=>"priv.key" ) ) {
+if( not $openssl->genKey( BITS=>512, OUTFILE=>"priv.key", PASSWD=>"ciccio" ) ) {
  	print "Error";
 }
 
-$openssl->genReq( OUTFILE=>"req.pem", KEYFILE=>"priv.key",
+$openssl->genReq( OUTFILE=>"req.pem", KEYFILE=>"priv.key", PASSWD=>"ciccio",
  		DN=>["madwolf\@openca.org", "Massimiliano Pala", "", "", "" ] );
 
 $p = $openssl->genCert( KEYFILE=>"priv.key", REQFILE=>"req.pem", DAYS=>500,
-			OUTFILE=>"cert.pem");
+			OUTFILE=>"cert.pem", PASSWD=>"ciccio");
 
 $k = $openssl->dataConvert( INFILE=>"cert.pem",
  			    DATATYPE=>CERTIFICATE,
@@ -32,7 +32,15 @@ $k = $openssl->dataConvert( INFILE=>"req.pem",
 
 ## print "$k\n\n";
 
-$crl = $openssl->issueCrl( CACERT=>"cert.pem", CAKEY=>"priv.key",
+## print "\nRevoking Certificate 00 ... ";
+## if( not $openssl->revoke( CACERT=>"cert.pem", CAKEY=>"priv.key",
+## 		   	 INFILE=>"cert.pem") ) {
+## 	print "Error!\n\n";
+## 	exit 0;
+## }
+## print "Ok.\n";
+
+$crl = $openssl->issueCrl( CACERT=>"cert.pem", CAKEY=>"priv.key", PASSWD=>"ciccio",
 			   OUTFORM=>TXT, DAYS=>"500");
 
 print "$crl\n";

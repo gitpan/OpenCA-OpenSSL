@@ -4,5 +4,5 @@ MANIFEST
 OpenSSL.pm
 LICENSE
 test.pl
-prova.pl
 doc/openca-openssl.html
+test/openssl_test.pl
