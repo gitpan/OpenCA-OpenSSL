@@ -56,7 +56,7 @@ use strict;
 
 package OpenCA::OpenSSL;
 
-$OpenCA::OpenSSL::VERSION = '0.6.3a';
+$OpenCA::OpenSSL::VERSION = '0.8.34';
 
 ## Global Variables Go HERE
 my %params = (
@@ -66,6 +66,8 @@ my %params = (
 	 baseDir => undef,
 	 verify => undef,
 	 sign => undef,
+	 errno => undef,
+	 errval => undef
 );
 
 ## Create an instance of the Class
@@ -107,6 +109,9 @@ sub new {
 		return;
 	};
 
+	$self->{errno} = 0;
+	$self->{errval} = "";
+
         return $self;
 }
 
@@ -131,6 +136,18 @@ sub setParams {
 	return 1;
 }
 
+sub errno {
+        my $self = shift;
+
+        return $self->{errno};
+}
+
+sub errval {
+        my $self = shift;
+
+        return $self->{errval};
+}
+
 sub genKey {
 
 	## Generate a new key, arguments accepted are, in order
@@ -143,8 +160,13 @@ sub genKey {
 	my $outfile = $keys->{OUTFILE};
 	my $alg     = $keys->{ALGORITHM};
 	my $passwd  = $keys->{PASSWD};
+	my $engine  = ( $ENV{'engine'} or $keys->{ENGINE} );
 
 	my $command = "$self->{shell} genrsa ";
+
+	if( $engine ) {
+		$command .= "-engine $engine ";
+	}
 
 	if( $passwd ) {
 		$command .= "-passout env:pwd ";
@@ -191,9 +213,12 @@ sub genReq {
 	my $self = shift;
 	my $keys = { @_ };
 
+	my $engine  = ( $ENV{'engine'} or $keys->{ENGINE} );
+
 	my $outfile = $keys->{OUTFILE};
 	my $outform = $keys->{OUTFORM};
 	my $keyfile = $keys->{KEYFILE};
+	my $subject = $keys->{SUBJECT};
 	my $passwd  = $keys->{PASSWD};
 	my @DN      = @{ $keys->{DN} };
 	my $command = "$self->{shell} req -new ";
@@ -206,7 +231,12 @@ sub genReq {
 		$command .= "-config " . $self->{cnf} . " ";
 	}
 
+	if( $engine ) {
+                $command .= "-engine $engine ";
+        }
+
 	$command .= "-passin env:pwd " if ( $passwd ne "" );
+	$command .= "-subj \"$subject\" " if ( $subject );
 
 	$outform = uc( $outform );
 	if ( $outform =~ /(PEM|DER)/i ) {
@@ -230,10 +260,11 @@ sub genReq {
 		## 	print FD "$passwd\n";
 		## }
 
-		foreach $tmp (@DN) {
-			print FD "$tmp\n";
+		if( not $subject ) {
+			foreach $tmp (@DN) {
+				print FD "$tmp\n";
+			}
 		}
-
 	close(FD);
 
 	$ENV{'pwd'} = "";
@@ -273,11 +304,17 @@ sub genCert {
 	my $days    = $keys->{DAYS};
 	my $tmpfile = $self->{tmpDir} . "/${$}_crt.tmp";
 
+	my $engine  = ( $ENV{'engine'} or $keys->{ENGINE} );
+
 	my $command = "$self->{shell} req -x509 ";
 
 	my ( $ret, $tmp );
 
 	return if( (not $keyfile) or (not $reqfile) );
+
+        if( $engine ) {
+                $command .= "-engine $engine ";
+        }
 
 	$command .= "-passin env:pwd " if ( $passwd ne "" );
 	$command .= "-config ". $self->{cnf} . " " if ( $self->{cnf} ne "" );
@@ -292,9 +329,12 @@ sub genCert {
 	}
 
 	$ENV{'pwd'} = $passwd;
-	open( FD, "|$command" ) || return ;
-		## print FD "$passwd\n";
-	close(FD);
+	$ret = `$command`;
+	return if( $? != 0 );
+
+	## open( FD, "|$command" ) || return ;
+	## close(FD);
+
 	$ENV{'pwd'} = "";
 
 	if( $? != 0 ) {
@@ -335,15 +375,19 @@ sub dataConvert {
 	my $outfile = $keys->{OUTFILE};
 	my $infile  = $keys->{INFILE};
 
-	my ( $ret, $tmpfile );
+	my ( $command, $tmp, $ret, $tmpfile );
 
-	return if( not $type);
-	return if( (not $data) and (not $infile));
+	return if ( not $type);
+	return if ( (not $data) and (not $infile));
+
+	## Return if $infile does not exists
+	return if( ($infile) and ( not -e $infile ));
 
 	$outform = "PEM" if( not $outform ); 
 	$inform  = "PEM" if( not $inform ); 
 
-	my $command = "$self->{shell} ";
+	$tmpfile = "$self->{tmpDir}/${$}_cnv.tmp";
+	$command = "$self->{shell} ";
 
 	     if( $type =~ /CRL/i ) {
 		$command .= " crl ";
@@ -356,7 +400,9 @@ sub dataConvert {
 		return;
 	}
 
-	$command .= "-out $outfile " if ( $outfile ne "" ); 
+	$outfile = $tmpfile if ( not $outfile );
+
+	$command .= "-out $outfile ";
 	$command .= "-in $infile " if ( $infile ne "" ); 
 
 	     if( $outform =~ /TXT/i ) {
@@ -376,34 +422,57 @@ sub dataConvert {
 	}
 
 	if( $infile ne "" ) {
-		$ret=`$command 2>&1`;
-		## return if ( $? != 0 );
+		$ret=`$command`;
 	} else {
-		if( $outfile eq "" ) {
-			$tmpfile = $self->{tmpDir} . "/${$}_cnv.tmp";
-			$command .= " -out $tmpfile";
-		} else {
-			$tmpfile = $outfile;
-		}
-
 		open( FD, "|$command" ) or return;
 			print FD "$data";
-		close(FD);
+		close( FD );
+	}
+	## return if( $? != 0 );
+
+	if( exists $keys->{OUTFILE} ) {
+		return 1;
+	}
+
+	$ret = "";
+	open( TMP, "<$outfile" ) or return;
+		while( $tmp = <TMP> ) {
+			$ret .= $tmp;
+		}
+	close( TMP );
+	unlink( $outfile );
+
+	return $ret;
+		
+	## if( $infile ne "" ) {
+	## 	$ret=`$command`;
+		## return if ( $? != 0 );
+	## } else {
+	## 	if( $outfile eq "" ) {
+	## 		$tmpfile = $self->{tmpDir} . "/${$}_cnv.tmp";
+	## 		$command .= " -out $tmpfile";
+	## 	} else {
+	## 		$tmpfile = $outfile;
+	## 	}
+
+	## 	open( FD, "|$command" ) or return;
+	## 		print FD "$data";
+	## 	close( FD );
 
 		## return if( $? != 0 );
 
-		open( TMP, "<$tmpfile" ) or return;
-			my $tmp;
-			$ret = "";
+	## 	open( TMP, "<$tmpfile" ) or return;
+	## 		my $tmp;
+	## 		$ret = "";
 
-			while( $tmp = <TMP> ) {
-				$ret .= $tmp;
-			}
-		close(TMP);
-		unlink( $tmpfile );
-	}
+	## 		while( $tmp = <TMP> ) {
+	## 			$ret .= $tmp;
+	## 		}
+	## 	close(TMP);
+	## 	unlink( $tmpfile );
+	## }
 
-	return "$ret";
+	## return "$ret";
 
 }
 
@@ -430,38 +499,70 @@ sub issueCert {
 	my $reqdata  = $keys->{REQDATA};
 	my $reqfile  = $keys->{REQFILE};
 	my $inform   = $keys->{INFORM};
-	my $preserve = $keys->{PRESERVE_DN};
+	my $preserve = ( $keys->{PRESERVE_DN} or "N" );
 	my $cakey    = $keys->{CAKEY};
-	my $cacert   = $keys->{CACERT};
 	my $days     = $keys->{DAYS};
 	my $startDate= $keys->{START_DATE};
 	my $endDate  = $keys->{END_DATE};
 	my $passwd   = $keys->{PASSWD};
 	my $exts     = $keys->{EXTS};
+	my $extFile  = $keys->{EXTFILE};
 	my $reqtype  = $keys->{REQTYPE};
+	my $subject  = $keys->{SUBJECT};
+
+	my $reqfiles =$keys->{REQFILES};
+	my $outdir   =$keys->{OUTDIR};
 	my $caName   = $keys->{CA_NAME};
 	
+	my $engine  = ( $ENV{'engine'} or $keys->{ENGINE} );
+
 	my ( $ret, $tmpfile );
 
-	return if( (not $reqdata) and (not $reqfile));
+
+	#return if( (not $reqdata) and (not $reqfile));
+	# to make multi certs you need to tell openssl 
+	# what directory to put it.
+	return if( (not $reqdata) and (not $reqfile) and
+		((not $reqfiles) and (not $outdir)) );
 
 	$inform   = "PEM" if( not $inform ); 
 	$reqtype  = "NETSCAPE" if( not $reqtype ); 
 
 	my $command = "$self->{shell} ca -batch ";
 
+        if( $engine ) {
+                $command .= "-engine $engine ";
+        }
+
 	$command .= "-config " .$self->{cnf}." " if ( $self->{cnf} );
 	$command .= "-keyfile $cakey " if( $cakey );
-	$command .= "-key $passwd " if ( $passwd );
+	$command .= "-passin env:pwd " if ( $passwd ne "" );
 	$command .= "-days $days " if ( $days );
+	$command .= "-extfile $extFile " if ( $extFile );
 	$command .= "-extensions $exts " if ( $exts );
 	$command .= "-preserveDN " if ( $preserve =~ /Y/i );
 	$command .= "-startdate $startDate " if ( $startDate );
 	$command .= "-enddate $endDate " if ( $endDate );
 	$command .= "-name $caName " if ( $caName );
+	$command .= "-subj \"$subject\" " if ( $subject );
 
-	     if( $inform =~ /(PEM|DER|NET)/i ) {
-		$command .= "-inform " . uc($inform) ." ";
+	# this got moved because if -infiles
+	# is going to be used it has to be the last
+	# option.
+	if ( $reqtype =~ /MSIE/i ) {
+		$command .= "-msie_hack ";
+	} elsif ($reqtype =~ /NETSCAPE/i ) {
+		## Nothing to do...
+	} else {
+		return;
+	}
+
+	if( $inform =~ /(PEM|DER|NET)/i ) {
+
+		#this has to be the last option
+		$command .= "-outdir $outdir " if ($outdir);
+		$command .=  "-infiles @$reqfiles" if ($reqfiles);
+
 		$command .= "-in $reqfile " if ( $reqfile );
 	} elsif ( $inform =~ /SPKAC/ ) {
 		return if ( not $reqfile );
@@ -471,21 +572,17 @@ sub issueCert {
 		return;
 	}
 
-	if ( $reqtype =~ /MSIE/i ) {
-		$command .= "-msie_hack ";
-	} elsif ($reqtype =~ /NETSCAPE/i ) {
-		## Nothing to do...
-	} else {
-		return;
-	}
-
 	if( $reqfile ne "" ) {
+		$ENV{'pwd'} = $passwd;
 		$ret = `$command`;
+		$ENV{'pwd'} = "";
 		return if( $? != 0);
 	} else {
+		$ENV{'pwd'} = $passwd;
 		open( FD, "|$command" ) || return;
 			print "$reqdata";
 		close(FD);
+		$ENV{'pwd'} = "";
 
 		return if( $? != 0);
 	}
@@ -508,21 +605,30 @@ sub revoke {
 	my $passwd   = $keys->{PASSWD};
 	my $certFile = $keys->{INFILE};
 
+	my $engine  = ( $ENV{'engine'} or $keys->{ENGINE} );
+
 	my ( $tmp, $ret );
 	my $command = "$self->{shell} ca -revoke \"$certFile\" ";
 
 	return if (not $certFile);
 
+        if( $engine ) {
+                $command .= "-engine $engine ";
+        }
+
 	$command .= "-config " . $self->{cnf}. " " if ( $self->{cnf} ne "" );
 	$command .= "-keyfile $cakey " if( $cakey ne "" );
-	$command .= "-key $passwd " if ( $passwd ne "" );
+	$command .= "-passin env:pwd " if ( $passwd ne "" );
+	## $command .= "-key $passwd " if ( $passwd ne "" );
 	$command .= "-cert $cacert " if ( $cacert ne "" );
 
+	$ENV{'pwd'} = $passwd;
 	open( FD, "$command|" ) || return;
 		while( $tmp = <FD> ) {
 			$ret .= $tmp;
 		}
 	close(FD);
+	$ENV{'pwd'} = "";
 
 	if( $? != 0) {
 		return;
@@ -552,71 +658,55 @@ sub issueCrl {
 	my $outfile  = $keys->{OUTFILE};
 	my $outform  = $keys->{OUTFORM};
 	my $exts     = $keys->{EXTS};
+	my $extfile  = $keys->{EXTFILE};
+
+	my $engine  = ( $ENV{'engine'} or $keys->{ENGINE} );
 	
-	my ( $ret, $tmpfile );
+	my ( $ret, $tmp, $tmpfile );
 	my $command = "$self->{shell} ca -gencrl ";
+
+        if( $engine ) {
+                $command .= "-engine $engine ";
+        }
 
 	if ( $outfile eq "" ){
 		$tmpfile = $self->{tmpDir} . "/${$}_crl.tmp";
-		$command .= "-out $tmpfile ";
 	} else {
-		$command .= "-out $outfile ";
+		$tmpfile = $outfile;
 	}
+	$command .= "-out $tmpfile ";
 
 	$command .= "-config " . $self->{cnf}. " " if ( $self->{cnf} ne "" );
 	$command .= "-keyfile $cakey " if( $cakey ne "" );
-	$command .= "-key $passwd " if ( $passwd ne "" );
+	$command .= "-passin env:pwd " if ( $passwd ne "" );
 	$command .= "-cert $cacert " if ( $cacert ne "" );
 	$command .= "-crldays $days " if ( $days ne "" );
 	$command .= "-crlexts $exts " if ( $exts ne "" );
+	$command .= "-extfile $extfile " if ( $extfile ne "" );
 
-	open( FD, "|$command" ) || return;
-	close(FD);
+	$ENV{'pwd'} = $passwd;
+	$ret = `$command`;
+	$ENV{'pwd'} = "";
 
 	return if( $? != 0);
 
-##	if( $outform =~ /(DER|NET|TXT|PEM)/i ) {
-		my $tmp;
+	$ret = $self->dataConvert( INFILE  =>$tmpfile,
+				   OUTFORM =>$outform,
+				   DATATYPE=>"CRL" );
 
-		if ( $outfile ne "" ) {
-			$tmp = $outfile;
-		} else {
-			$tmp = $tmpfile;
-		}
+	return if( not $ret );
 
-		$ret = $self->dataConvert( INFILE  =>$tmp,
-					   OUTFORM =>$outform,
-					   DATATYPE=>"CRL" );
-		return if( not $ret );
+	if( $outfile ne "" ) {
+		open( FD, ">$outfile" ) or return;
+			print FD "$ret";
+		close( FD );
+		return 1;
+	}
 
-
-		if( $outfile ne "" ) {
-			open( FD, ">$outfile" ) or return;
-				print FD "$ret";
-			close(FD);
-			return 1;
-		} else {
-			unlink( $tmp );
-			return "$ret";
-		}
-##	} else {
-##		if( $outfile eq "" ) {
-##			open( FD, "<$tmp" ) or return;
-##				my $tmp;
-##				$ret = "";
-##
-##				while ( $tmp = <FD> ) {
-##					$ret .= "$tmp";
-##				}
-##			close(FD);
-##			unlink( $tmp );
-##
-##			return $ret;
-##		}
-##	}
+	unlink( $tmpfile );
+	return "$ret";
 
 	return 1;
-		
 }
 
 sub SPKAC {
@@ -628,47 +718,58 @@ sub SPKAC {
 	my $outfile = $keys->{OUTFILE};
 	my $spkac   = $keys->{SPKAC};
 
-	my $command = "$self->{shell} spkac -verify ";
+	my $command = $self->{shell} . " spkac -verify ";
 	my $tmpfile = $self->{tmpDir} . "/${$}_SPKAC.tmp";
-	my $ret;
 
-	$command .= "-in $infile " if( $infile ne "" );
-	$command .= "-out $outfile " if( $outfile ne "" );
+	my $engine  = ( $ENV{'engine'} or $keys->{ENGINE} );
 
-	if( $infile ne "" ) {
-		my $tmp;
+	my $ret = "";
+	my $retVal = 0;
+	my $tmp;
 
-		open( FD, "$command|" ) or return;
-			while( $tmp = <FD> ) {
-				$ret .= $tmp;
-			}
-		close(FD);
-
-		return if ( $? != 0 );
-
-	} else {
-		$command .= ">$tmpfile " if ( $outfile eq "" );
-
-		open( FD, "|$command" ) or return;
-			print FD "$spkac";
-		close(FD);
-
-		if( $? != 0 ) {
-			unlink( $tmpfile ) if( $outfile eq "" );
-			return;
-		}
-
-		open( TMP, "$tmpfile" ) or return;
-			my $tmp;
-			$ret = "";
-
-			while ( $tmp = <TMP> ) {
-				$ret .= $tmp;
-			};
-		close(TMP);
+	if( $spkac ne "" ) {
+		$infile = $self->{tmpDir} . "/${$}_in_SPKAC.tmp";
+		open( FD, ">$infile" ) or return;
+			print FD "$spkac\n";
+		close ( FD );
 	}
 
-	unlink( $tmpfile ) if( $outfile eq "" );
+        if( $engine ) {
+                $command .= "-engine $engine ";
+        }
+
+	$command .= "-in $infile " if( $infile ne "" );
+	if( $outfile ne "" ) {
+		$command .= "-out $outfile ";
+	} else {
+		$command .= "-out $tmpfile ";
+	}
+
+	open( FD, "|$command" ) or return;
+	close( FD );
+
+	## Store the ret value
+	$retVal = $?;
+
+	## Unlink the infile if it was temporary
+	unlink $infile if( $spkac ne "");
+
+	if( $outfile ne "" ) {
+		return if ( $retVal != 0 );
+
+		return 1;
+	}
+
+	## Get the output
+	open( TMP, "$tmpfile" ) or return;
+		while ( $tmp = <TMP> ) {
+			$ret .= $tmp;
+		}
+	close( TMP );
+	unlink $tmpfile if ($outfile eq "");
+
+	return if ( $retVal != 0 );
+
 	return $ret;
 }
 
@@ -684,6 +785,8 @@ sub getDigest {
 	my $alg     = lc( $keys->{ALGORITHM} );
 	my $tmpfile = $self->{tmpDir} . "/${$}_dgst.tmp";
 
+	my $engine  = ( $ENV{'engine'} or $keys->{ENGINE} );
+
 	my ( $command, $ret );
 
 	$alg = "md5" if( not $alg );
@@ -693,8 +796,14 @@ sub getDigest {
 	 	print FD $data;
 	close( FD );
 
-	$command = "$self->{shell} dgst -$alg <\"$tmpfile\"";
-	
+	$command = "$self->{shell} dgst -$alg ";
+
+        if( $engine ) {
+                $command .= "-engine $engine ";
+        }
+
+	$command .= "<\"$tmpfile\"";
+
 	$ret = `$command`;
 	$ret =~ s/\n//g;
 
@@ -726,10 +835,9 @@ sub verify {
 	my $tmpfile = $self->{tmpDir} . "/${$}_vrfy.tmp";
 	my $command = $self->{verify} . " ";
 
-	my ( $ret );
+	my ( $ret, $tmp );
 
 	$command   .= "-verbose " if ( $verbose );
-	$command   .= "-in $sigfile " if ($sigfile);
 	$command   .= "-cf $cacert " if ( $cacert );
 	$command   .= "-cd $cadir " if ($cadir);
 	$command   .= "-data $data " if ($data);
@@ -737,38 +845,44 @@ sub verify {
 	$command   .= "-no_chain $out" if ( $noChain );
 
 	if( $sigfile ) {
-		$ret=`$command`;
-	} else {
-		if( not $out ) {
-			$command .= " >$tmpfile";
-		}
-
-		open( FD, "|$command" ) or return;
-			print FD "$sig";
-		close(FD);
-
-		if ( $? ) {
-			unlink( $tmpfile ) if (not $out);
-			return;
-		}
-
-		if( not $out) {
-			$ret = "";
-			open( TMP, "<$tmpfile" ) or return;
-				do {
-					$ret .= <TMP>;
-				} while (not eof(TMP));
-			close(TMP);
-
-			unlink( $tmpfile );
-		}
+		open( SIG, "<$sigfile" ) or return;
+			while( not eof( SIG ) ) {
+				$sig .= <SIG>;
+			}
+		close( SIG );
 	}
 
-	## If we are here there have been no errors, so
-	## if $ret is empty, let's return a true value...
-	$ret = 1 if ( not $ret );
+	if( not $out ) {
+		$command .= " >\"$tmpfile\"";
+	}
 
-	return $ret;
+	$command .= " 2>\&1";
+	open( FD, "|$command" ) or return;
+		print FD "$sig";
+	close( FD );
+
+	$self->{errno} = $?;
+
+	$ret = "";
+	open( TMP, "<$tmpfile" ) or return;
+		while( not eof ( TMP ) ) {
+			$ret .= <TMP>;
+		}
+	close( TMP );
+
+	if ( $self->{errno} ) {
+		unlink( $tmpfile ) if (not $out);
+		( $self->{errno}, $self->{errval} ) = 
+			( $ret =~ /Verify Error\s*(.*?)\s*:\s*(.*?)\n/ );
+		return;
+	}
+
+	if( not $out) {
+		unlink( $tmpfile );
+		return $ret;
+	} else {
+		return 1;
+	}
 }
 
 sub sign {
@@ -784,7 +898,7 @@ sub sign {
 	my $cert    = $keys->{CERT_FILE};
 	my $key     = $keys->{KEY_FILE};
 	my $nonDetach = $keys->{INCLUDE_DATA};
-	my $pwd     = $keys->{PWD};
+	my $pwd     = ( $keys->{PWD} or $keys->{PASSWD} );
 	my $tmpfile = $self->{tmpDir} . "/${$}_sign.tmp";
 	my $command = $self->{sign} . " ";
 
@@ -795,7 +909,7 @@ sub sign {
 
 	$command   .= "-in $datafile " if ($datafile);
 	$command   .= "-out $out " if ( $out );
-	$command   .= "-key $key " if ( $pwd );
+	$command   .= "-key $pwd " if ( $pwd );
 	$command   .= "-nd " if ( $nonDetach );
 
 	$command   .= "-cert $cert -keyfile $key ";
@@ -847,6 +961,8 @@ sub getCertAttribute {
 	my $attribute 	= lc( $keys->{ATTRIBUTE} );
 	my $cmd 	= "$self->{shell} x509 -noout ";
 
+	my $engine  = ( $ENV{'engine'} or $keys->{ENGINE} );
+
 	my ( $ret );
 
 	my $tmpfile = $self->{tmpDir} . "/${$}_ATTRIBUTE.tmp";
@@ -867,6 +983,10 @@ sub getCertAttribute {
 	$attribute = "subject" if( uc ($attribute) eq "DN" );
 	$attribute = "pubkey" if( uc ($attribute) eq "KEY" );
 
+        if( $engine ) {
+                $cmd .= "-engine $engine ";
+        }
+
 	$cmd .= "-$attribute " if (exists $keys->{ATTRIBUTE} );
 	$ret = `$cmd`;
 
@@ -875,12 +995,74 @@ sub getCertAttribute {
 	if ( $? != 0 ) {
 		return;
 	} else {
-		$ret =~ s/\S+\=\s*//;
+		$ret =~ s/(.*?)=[\s\/]*//;
 		$ret =~ s/$(\n|\r)//;
 
 		return $ret;
 	}
 
+}
+
+sub pkcs7Certs {
+
+	my $self = shift;
+	my $keys = { @_ };
+
+	my $infile  = $keys->{INFILE};
+	my $outfile = $keys->{OUTFILE};
+	my $pkcs7   = $keys->{PKCS7};
+
+	my $command = $self->{shell} . " pkcs7 -print_certs ";
+	my $tmpfile = $self->{tmpDir} . "/${$}_SPKAC.tmp";
+
+	my $engine  = ( $ENV{'engine'} or $keys->{ENGINE} );
+
+	my $ret = "";
+	my $retVal = 0;
+	my $tmp;
+
+	$self->{errno} = 0;
+
+	if( $pkcs7 ne "" ) {
+		$infile = $self->{tmpDir} . "/${$}_in_SPKAC.tmp";
+		open( FD, ">$infile" ) or return;
+			print FD "$pkcs7\n";
+		close ( FD );
+	}
+
+        if( $engine ) {
+                $command .= "-engine $engine ";
+        }
+
+	$command .= "-in $infile " if( $infile ne "" );
+	if( $outfile ne "" ) {
+		$command .= "-out $outfile ";
+	} else {
+		$command .= "-out $tmpfile ";
+	}
+
+	$ret = `$command 2>&1`;
+	if( $? > 0 ) {
+		$self->{errno} = "$?";
+		$self->{errval} = "$ret";
+	}
+
+	## Unlink the infile if it was temporary
+	unlink $infile if( $pkcs7 ne "");
+
+	## Get the output
+	open( TMP, "$tmpfile" ) or return;
+		while ( $tmp = <TMP> ) {
+			$ret .= $tmp;
+		}
+	close( TMP );
+	unlink $tmpfile if ($outfile eq "");
+
+	if ( $self->{errno} != 0 ) {
+		return;
+	} else {
+		return $ret;
+	}
 }
 
 # Autoload methods go after =cut, and are processed by the autosplit program.
@@ -942,6 +1124,24 @@ parameter should be passed to the function like this:
 				     TMPDIR=>'/tmp',
 				     STDERR=>'/dev/null' );
 
+=head2 sub errno () - Get last command errno value.
+
+	This functions returns last operation's errno value. Non
+        zero value means there has been an error.
+
+	EXAMPLE:
+
+		print $openssl->errno;
+
+=head2 sub errval () - Get last command errval value.
+
+	This functions returns last operation's errval value. This
+        value usually has a brief error description.
+
+	EXAMPLE:
+
+		print $openssl->errval;
+
 =head2 sub genKey () - Generate a private Key.
 
 	This functions let you generate a new private key. Accepted
@@ -968,6 +1168,8 @@ parameter should be passed to the function like this:
 		PASSWD   - Password to decript key (if needed) (*);
 		DN       - Subject list (as required by openssl, see
 			   the openssl.cnf doc on policy);
+		SUBJECT  - DN string (use this instead of passing separate
+                           attributes list)(*);
 
 	(*) - Optional parameters;
 
@@ -975,6 +1177,9 @@ parameter should be passed to the function like this:
 
 		my $req = $openssl->genReq( KEYFILE=>"00_key.pem",
 			DN => [ "madwolf@openca.org","Max","","","" ] );
+
+		my $req = $openssl->genReq( KEYFILE=>"00_key.pem",
+			SUBJECT => "CN=Madwolf, O=OpenCA, C=IT" );
 
 
 =head2 sub genCert () - Generate a certificate from a request.
@@ -1029,7 +1234,12 @@ parameter should be passed to the function like this:
 
 		REQDATA       - Request;
 		REQFILE       - File containing the request (one of
-				REQDATA and REQFILE are required);
+				REQDATA, REQFILE or REQFILES are required);
+		REQFILES      - An array ref to an array of files that
+				contain the request.
+		OUTDIR        - What directory to put the files from 
+				REQFILES. (This is required iff 
+				you use REQFILES.)
 		INFORM        - Input format (PEM|DER|NET|SPKAC)(*);
 		PRESERVE_DN   - Preserve DN order (Y|N)(*);
 		CA_NAME	      - CA sub section to be used (take a
@@ -1087,6 +1297,7 @@ parameter should be passed to the function like this:
 		DAYS    - Days the CRL will be valid for(*);
 		EXTS    - Extentions to be added ( see the openssl.cnf
 			  pages for more help on this )(*);
+		EXTFILE - Extensions file to be used (*);
 		OUTFILE - Output file(*);
 		OUTFORM - Output format (PEM|DER|NET|TXT)(*);
 
@@ -1113,6 +1324,21 @@ parameter should be passed to the function like this:
 	EXAMPLE:
 
 		print $openssl->SPKAC( SPKAC=>$data, OUTFILE=>$target );
+
+=head2 sub pkcs7Certs () - Get PKCS7 structure certificate(s).
+
+	This function returns a PEM formatted (file or ret value)
+	contained in the pkcs7 structure. Accepted parameters are:
+
+		PKCS7     - pkcs7 data (*);
+		INFILE	  - A pkcs7 (signature?) file (*);
+		OUTFILE   - Output file (*);
+		
+	(*) - Optional parameters;
+
+	EXAMPLE:
+
+		print $openssl->pkcs7Cert( PKCS7=>$data, OUTFILE=>$target );
 
 =head2 sub getDigest () - Get a message digest.
 
