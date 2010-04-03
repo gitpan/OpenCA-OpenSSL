@@ -40,9 +40,10 @@ use strict;
 use File::Temp;
 use MIME::Parser;
 
-our $VERSION = substr q$Revision: 1.2 $, 10;
+## our $VERSION = substr q$Revision: 1.2 $, 10;
+($OpenCA::OpenSSL::SMIME::VERSION = '$Revision: 1.2 $' )=~ s/(?:^.*: (\d+))|(?:\s+\$$)/defined $1?"0\.9":""/eg;
 our $errno = undef;
-our $err = undef;
+our $errval = undef;
 
 
 ####### Private subs and vars
@@ -113,24 +114,33 @@ sub _setError {
 	if (scalar (@_) == 4) {
 		my $keys = { @_ };
 		$self->{errno}	= $keys->{ERRNO};
-		$self->{err}	= $keys->{ERRVAL};
+		$self->{errval}	= $keys->{ERRVAL};
 	} else {
 		$self->{errno}	= $_[0];
-		$self->{err}	= $_[1];
+		$self->{errval}	= $_[1];
 	}
 
-	$errno = $self->{errno};
-	$err = $self->{err};
+	$errno  = $self->{errno};
+	$errval = $self->{errval};
 
 	return undef unless($self->{errno});
 
-	if ($self->{DEBUG}) {
-		print "OpenCA::OpenSSL::SMIME->_setError: errno:".$self->{errno}."<br>\n";
-		print "OpenCA::OpenSSL::SMIME->_setError: err:".$self->{err}."<br>\n";
-	}
-	warn("$self->{errl} ($self->{errno})") if($^W);
+        $self->_debug ("_setError: errno: $self->{errno}");
+        $self->_debug ("_setError: errval: $self->{errval}");
+	warn("$self->{errval} ($self->{errno})") if($^W);
 	## support for: return $self->_setError (1234, "Something fails.") if (not $xyz);
 	return undef;
+}
+
+sub _debug
+{
+    my $self = shift;
+
+    return 1 if (not $self->{DEBUG});
+
+    print STDERR "OpenCA::OpenSSL::SMIME->".join (" ", @_)."\n";
+
+    return 1;
 }
 
 # Syncing textual and MIME::Entity representations of the object.
@@ -188,13 +198,13 @@ sub _save_headers {
 		$self->_sync_data() or return(undef);
 	}
 
-	# If we have no headers' cache, create a new one.
+	# // If we have no headers' cache, create a new one.
 	$self->{headers_cache} = MIME::Head->new()
 		unless($self->{headers_cache});
 
 	# Copy headers
 	foreach($self->{entity}->head()->tags()) {
-		next if(/^(content|MIME)/i);	# don't save MIME headers
+		next if(/^(content|MIME)/i);	# // don't save MIME headers
 		$tag = $_;
 		if($self->{needs_extract} < 0) {	# priority: old headers
 			next if($self->{headers_cache}->count($tag));
@@ -214,36 +224,57 @@ sub _save_headers {
 # Forks and execs subprocess, capturing stderr and exit code. returns
 # (exit_code, stderr) in list context and exit_code on scalar context.
 sub _exec {
-	my($self, @arg) = @_;
-	my($child, $res);
+    my($self, @arg) = @_;
 
-	$self->_setError(0, "");
+    $self->_debug ("_exec: resetting errorcode");
+    $self->_setError(0, "");
 
-	if($self->{DEBUG}) {
-		print "OpenCA::OpenSSL::SMIME->_exec: about to exec:<br>\n";
-		print "OpenCA::OpenSSL::SMIME->_exec: " . join(' ', @arg) . "<br>\n";
-	}
+    my $command = join ' ', @arg;
+    $self->_debug ("_exec: command $command");
 
-	defined($child = open(OUT, '-|'))
-		or return($self->_setError(8096001, 'OpenCA::OpenSSL::SMIME->_exec: Can\'t fork'));
-	if($child) {
-		$res = join('', <OUT>);
-		close(OUT) or not $! or return($self->_setError(8096002, 'OpenCA::OpenSSL::SMIME->_exec: Problems executing ' . join(' ', @arg)));
+    ## exexcution in parent environment
 
-	} else {
-		select(STDERR); $| = 1;		# make unbuffered
-		select(STDOUT); $| = 1;		# make unbuffered
-		open(STDERR, ">&STDOUT") or die "Can't dup stdout";
-		open(STDOUT, ">/dev/null") or die "Can't close stdout";
+    my $res = $self->{backend}->_execute_command (COMMAND   => $command,
+                                                  KEY_USAGE => $self->{ENGINE});
+    if (not defined $res)
+    {
+        $self->_setError ($self->{backend}->errno,
+                         $self->{backend}->errval);
+        if(wantarray) {
+            return($self->errno, $self->errval);
+        } else {
+            return($self->errno);
+        }
+    } else {
+        $res = "" if ($res == 1);
+        if (wantarray) {
+            return(0, $res);
+        } else {
+            return(0);
+        }
+    }
 
-		exec(@arg) or die "Can't exec";
-	}
-
-	if(wantarray) {
-		return($?, $res);
-	} else {
-		return($?);
-	}
+#    my($child, $res);
+#	defined($child = open(OUT, '-|'))
+#		or return($self->_setError(8096001, 'OpenCA::OpenSSL::SMIME->_exec: Can\'t fork'));
+#	if($child) {
+#		$res = join('', <OUT>);
+#		close(OUT) or not $! or return($self->_setError(8096002, 'OpenCA::OpenSSL::SMIME->_exec: Problems executing ' . join(' ', @arg)));
+#
+#	} else {
+#		select(STDERR); $| = 1;		# make unbuffered
+#		select(STDOUT); $| = 1;		# make unbuffered
+#		open(STDERR, ">&STDOUT") or die "Can't dup stdout";
+#		open(STDOUT, ">/dev/null") or die "Can't close stdout";
+#
+#		exec(@arg) or die "Can't exec";
+#	}
+#
+#	if(wantarray) {
+#		return($?, $res);
+#	} else {
+#		return($?);
+#	}
 }
 
 # Strips non-mime headers.
@@ -257,7 +288,7 @@ sub _strip_headers {
 
 	$modified = 0;
 	foreach($self->{entity}->head()->tags()) {
-		next if(/^(content|MIME)/i);	# don't touch MIME headers
+		next if(/^(content|MIME)/i);	# // don't touch MIME headers
 		$self->{entity}->head()->delete($_);
 		$modified++;
 	}
@@ -292,6 +323,7 @@ sub new {
 
 	if(ref($that)) {			# get some defaults from creator
 		$self->{backend}	= $that->{backend};
+		$self->{gettext}	= $that->{gettext};
 		$self->{tmpDir}		= $that->{tmpDir};
 		$self->{DEBUG}		= $that->{DEBUG};
 		$self->{ca_certs}	= $that->{ca_certs};
@@ -299,9 +331,13 @@ sub new {
 	}
 	$self->set_params( @_ ) or return(undef);
 
-	return $self->_setError(8000001, 'OpenCA::OpenSSL::SMIME->new: Missing required parameter: SHELL')
+	return $self->_setError(8000000, 'OpenCA::OpenSSL::SMIME->new: Missing required parameter: GETTEXT')
+		unless($self->{gettext});
+	return $self->_setError(8000001,
+                   $self->{gettext} ("OpenCA::OpenSSL::SMIME->new: Missing required parameter: SHELL"))
 		unless($self->{backend});
-	return $self->_setError(8000002, 'OpenCA::OpenSSL::SMIME->new: Invalid required parameter: SHELL')
+	return $self->_setError(8000002,
+                   $self->{gettext} ("OpenCA::OpenSSL::SMIME->new: Invalid required parameter: SHELL"))
 		unless(ref($self->{backend}));
 
         return $self;
@@ -316,6 +352,7 @@ sub set_params {
 
 	foreach $key (keys %{$params}) {
 		$self->{backend}   = $params->{$key} if ($key eq 'SHELL');
+		$self->{gettext}   = $params->{$key} if ($key eq 'GETTEXT');
 		$self->{tmpDir}    = $params->{$key} if ($key eq 'TMPDIR');
 		$self->{DEBUG}     = $params->{$key} if ($key eq 'DEBUG');
 		$self->{ENGINE}    = $params->{$key} if ($key =~ /ENGINE/i);
@@ -327,12 +364,14 @@ sub set_params {
 
 	# Check and save CA_CERTS
 	if($params->{CA_CERTS}) {
-		return $self->_setError(8001001, 'OpenCA::OpenSSL::SMIME->set_params: Invalid parameter for CA_CERTS')
+		return $self->_setError(8001001,
+                           $self->{gettext} ("OpenCA::OpenSSL::SMIME->set_params: Invalid parameter for CA_CERTS"))
 			unless(ref($params->{CA_CERTS}) eq 'ARRAY');
 
 		my($data);
 		foreach(@{$params->{CA_CERTS}}) {
-			return $self->_setError(8001002, 'OpenCA::OpenSSL::SMIME->set_params: Invalid array element for CA_CERTS')
+			return $self->_setError(8001002,
+                                   $self->{gettext} ("OpenCA::OpenSSL::SMIME->set_params: Invalid array element for CA_CERTS"))
 				unless(ref($_) && $_->getPEM());
 			$self->{ca_certs}->{$_->getParsed()->{DN}} = $_;
 			$data .= $_->getPEM() . "\n";
@@ -343,7 +382,8 @@ sub set_params {
 	# Processing of input data
 	if($params->{ENTITY}) {
 
-		return $self->_setError(8001003, 'OpenCA::OpenSSL::SMIME->set_params: Invalid data source')
+		return $self->_setError(8001003,
+                           $self->{gettext} ("OpenCA::OpenSSL::SMIME->set_params: Invalid data source"))
 			unless(ref($params->{ENTITY}));
 
 		$self->{entity} = $params->{ENTITY};
@@ -360,7 +400,8 @@ sub set_params {
 			$self->{file} = $self->_save_tmp(join('', @{$params->{DATA}}))
 				or return(undef);
 		} else {
-			return $self->_setError(8001003, 'OpenCA::OpenSSL::SMIME->set_params: Invalid argument to DATA');
+			return $self->_setError(8001003,
+                                   $self->{gettext} ("OpenCA::OpenSSL::SMIME->set_params: Invalid argument to DATA"));
 		}
 
 		$self->{entity} = undef;
@@ -375,7 +416,8 @@ sub set_params {
 		$self->{needs_extract} = 1;
 
 	} elsif(! $self->{file} || ! $self->{entity}) {
-		return $self->_setError(8001004, 'OpenCA::OpenSSL::SMIME->set_params: Missing data source');
+		return $self->_setError(8001004,
+                           $self->{gettext} ("OpenCA::OpenSSL::SMIME->set_params: Missing data source"));
 	}
 
 	return 1;
@@ -403,12 +445,12 @@ sub errno {
 	}
 }
 
-sub err {
+sub errval {
         my $self = shift;
         if(ref($self)) {
-		return $self->{err};
+		return $self->{errval};
 	} else {
-		return $err;
+		return $errval;
 	}
 }
 
@@ -418,11 +460,14 @@ sub sign {
 
 	$self->_setError(0, "");
 
-	return($self->_setError(8010001, 'OpenCA::OpenSSL::SMIME->sign: Missing required parameter: CERTIFICATE')) unless($params{CERTIFICATE});
+	return($self->_setError(8010001,
+                   $self->{gettext} ("OpenCA::OpenSSL::SMIME->sign: Missing required parameter: CERTIFICATE"))) unless($params{CERTIFICATE});
 
-	return($self->_setError(8010002, 'OpenCA::OpenSSL::SMIME->sign: Invalid required parameter: CERTIFICATE')) unless(ref($params{CERTIFICATE}));
+	return($self->_setError(8010002,
+                   $self->{gettext} ("OpenCA::OpenSSL::SMIME->sign: Invalid required parameter: CERTIFICATE"))) unless(ref($params{CERTIFICATE}));
 
-	return($self->_setError(8010003, 'OpenCA::OpenSSL::SMIME->sign: Missing required parameter: PRIVATE_KEY')) unless($params{PRIVATE_KEY});
+	return($self->_setError(8010003,
+                   $self->{gettext} ("OpenCA::OpenSSL::SMIME->sign: Missing required parameter: PRIVATE_KEY"))) unless($params{PRIVATE_KEY});
 
 	# If we have no entity, get it.
 	unless($self->{entity}) {
@@ -460,10 +505,12 @@ sub sign {
 	# Create a copy of the entity, the headers cache and the filename
 	if($self->{headers_cache}) {
 		$oldhead = $self->{headers_cache}->dup()
-			or return($self->_setError(8010004, 'OpenCA::OpenSSL::SMIME->sign: Can\'t duplicate headers cache for backup'));
+			or return($self->_setError(8010004,
+                                      $self->{gettext} ("OpenCA::OpenSSL::SMIME->sign: Can't duplicate headers cache for backup")));
 	}
 	$oldentity = $self->{entity}->dup()
-		or return($self->_setError(8010005, 'OpenCA::OpenSSL::SMIME->sign: Can\'t duplicate message for backup'));
+		or return($self->_setError(8010005,
+                              $self->{gettext} ("OpenCA::OpenSSL::SMIME->sign: Can't duplicate message for backup")));
 	$oldfile = $self->{file};
 
 	# Save headers if necessary.
@@ -482,15 +529,21 @@ sub sign {
 
 	my(@command, $outfile);
 	$outfile = $self->_save_tmp("");
-	push(@command, $self->{backend}->{shell}, "smime", "-sign");
+	push(@command, "smime", "-sign");
 
-	push(@command, "-engine", $self->get_param ("ENGINE", %params))
+	push(@command, "-engine", $self->get_param ("ENGINE", %params),
+                       "-keyform", $self->get_param ("KEYFORM", %params))
 		if($self->get_param ("ENGINE", %params));
 
 	push(@command, "-nocerts") if($params{NO_INCLUDE_CERTS});
-	push(@command, "-nodetach");	# FIXME : find out why detached smime
-					# get corrupted in transit
-#if($params{NO_DETACH});
+
+	if($params{DETACH}) {
+		# FIXME : find out why detached smime
+		# get corrupted in transit
+	} else {
+		push(@command, "-nodetach");	
+	}
+
 	push(@command, "-passin", "env:pwd") if($params{KEY_PASSWORD});
 	push(@command, "-certfile", $cafile) if($cafile);
 	push(@command, "-signer", $certfile,
@@ -499,6 +552,10 @@ sub sign {
 		       "-out", $outfile);
 
 	my($ec, $res) = $self->_exec(@command);
+
+	foreach my $oo ( @command ) {
+		$self->_debug("SMIME COMMAND: $oo");
+	}
 
 	delete($ENV{'pwd'}) if (defined($params{KEY_PASSWORD}));
 
@@ -515,7 +572,9 @@ sub sign {
 			$self->{entity} = $oldentity;
 			$self->{file} = $oldfile;
 		}
-		return($self->_setError(8010006, 'OpenCA::OpenSSL::SMIME->sign: unknown problem signing: $res'));
+		return($self->_setError(8010006,
+                           $self->{gettext} ("OpenCA::OpenSSL::SMIME->sign: unknown problem signing: __ERRVAL__",
+                                             "__ERRVAL__", $res)));
 	}
 
 	$self->{file} = $outfile;	# Save result
@@ -538,11 +597,13 @@ sub verify {
 
 	# Check parameters
 	unless(! $params{CERTIFICATE} || ref($params{CERTIFICATE})) {
-		return($self->_setError(8011001, 'OpenCA::OpenSSL::SMIME->verify: Invalid argument for CERTIFICATE'));
+		return($self->_setError(8011001,
+                           $self->{gettext} ("OpenCA::OpenSSL::SMIME->verify: Invalid argument for CERTIFICATE")));
 	}
 
 	unless($params{CERTIFICATE} || $params{USES_EMBEDDED_CERT}) {
-		return($self->_setError(8011002, 'OpenCA::OpenSSL::SMIME->verify: No certificate specified and not using embedded certificate'));
+		return($self->_setError(8011002,
+                           $self->{gettext} ("OpenCA::OpenSSL::SMIME->verify: No certificate specified and not using embedded certificate")));
 	}
 
 	# Set up files
@@ -559,7 +620,8 @@ sub verify {
 	# Create a copy of the headers cache
 	if($self->{headers_cache}) {
 		$oldhead = $self->{headers_cache}->dup()
-			or return($self->_setError(8011003, 'OpenCA::OpenSSL::SMIME->verify: Can\'t duplicate headers cache for backup'));
+			or return($self->_setError(8011003,
+                                      $self->{gettext} ("OpenCA::OpenSSL::SMIME->verify: Can't duplicate headers cache for backup")));
 	}
 
 	# Save headers if necessary.
@@ -567,8 +629,9 @@ sub verify {
 		$self->_save_headers() or return(undef);
 	}
 
-	push(@command, $self->{backend}->{shell}, "smime", "-verify");
-	push(@command, "-engine", $self->get_param ("ENGINE", %params))
+	push(@command, "smime", "-verify");
+	push(@command, "-engine", $self->get_param ("ENGINE", %params),
+                       "-keyform", $self->get_param ("KEYFORM", %params))
 		if($self->get_param ("ENGINE", %params));
 	push(@command, "-nointern") unless($params{USES_EMBEDDED_CERT});
 	push(@command, "-CAfile", $self->{ca_certs_file}) if($self->{ca_certs_file});
@@ -620,11 +683,15 @@ sub verify {
 		} elsif($res =~ /:digest failure:|:signature failure:/) {
 			$self->_set_status(1105, 'corrupted message');
 		} elsif($res =~ /:no content type:/) {
-			return($self->_setError(8011004, 'OpenCA::OpenSSL::SMIME->verify: found invalid mime stream'));
+			return($self->_setError(8011004,
+                                   $self->{gettext} ("OpenCA::OpenSSL::SMIME->verify: found invalid mime stream")));
 		} elsif($res =~ /:No such file or directory:/) {
-			return($self->_setError(8011005, 'OpenCA::OpenSSL::SMIME->verify: missing file'));
+			return($self->_setError(8011005,
+                                   $self->{gettext} ("OpenCA::OpenSSL::SMIME->verify: missing file")));
 		} else {
-			return($self->_setError(8011006, 'OpenCA::OpenSSL::SMIME->verify: unknown error: '. $res));
+			return($self->_setError(8011006,
+                                   $self->{gettext} ("OpenCA::OpenSSL::SMIME->verify: unknown error: __ERRVAL__",
+                                                     "__ERRVAL__", $res)));
 		}
 		return undef;
 	}
@@ -646,12 +713,16 @@ sub encrypt {
 
 	$self->_setError(0, "");
 
-	return($self->_setError(8012001, 'OpenCA::OpenSSL::SMIME->encrypt: Missing required parameter: CERTIFICATE')) unless($params{CERTIFICATE});
-	return($self->_setError(8012002, 'OpenCA::OpenSSL::SMIME->encrypt: Invalid required parameter: CERTIFICATE')) unless(ref($params{CERTIFICATE}));
+	return($self->_setError(8012001,
+                   $self->{gettext} ("OpenCA::OpenSSL::SMIME->encrypt: Missing required parameter: CERTIFICATE"))) unless($params{CERTIFICATE});
+	return($self->_setError(8012002,
+                   $self->{gettext} ("OpenCA::OpenSSL::SMIME->encrypt: Invalid required parameter: CERTIFICATE"))) unless(ref($params{CERTIFICATE}));
 
 	# Default for cipher, check correctness.
 	$cipher = lc($params{CIPHER} || $Ciphers[0]);
-	return $self->_setError(8012003, 'OpenCA::OpenSSL::SMIME->encrypt: Invalid cipher: ' . $cipher)
+	return $self->_setError(8012003,
+                   $self->{gettext} ("OpenCA::OpenSSL::SMIME->encrypt: Invalid cipher: __CIPHER__",
+                                     "__CIPHER__", $cipher))
 		unless(grep({ $_ eq $cipher } @Ciphers));
 
 
@@ -667,10 +738,12 @@ sub encrypt {
 	# Create a copy of the entity, the headers cache and the filename
 	if($self->{headers_cache}) {
 		$oldhead = $self->{headers_cache}->dup()
-			or return($self->_setError(8012004, 'OpenCA::OpenSSL::SMIME->encrypt: Can\'t duplicate headers cache for backup'));
+			or return($self->_setError(8012004,
+                                      $self->{gettext} ("OpenCA::OpenSSL::SMIME->encrypt: Can't duplicate headers cache for backup")));
 	}
 	$oldentity = $self->{entity}->dup()
-		or return($self->_setError(8012005, 'OpenCA::OpenSSL::SMIME->encrypt: Can\'t duplicate message for backup'));
+		or return($self->_setError(8012005,
+                              $self->{gettext} ("OpenCA::OpenSSL::SMIME->encrypt: Can't duplicate message for backup")));
 	$oldfile = $self->{file};
 
 	# Save headers if necessary.
@@ -686,9 +759,10 @@ sub encrypt {
 
 	my(@command, $outfile);
 	$outfile = $self->_save_tmp("");
-	push(@command, $self->{backend}->{shell}, "smime", "-encrypt");
+	push(@command, "smime", "-encrypt");
 
-	push(@command, "-engine", $self->get_param ("ENGINE", %params))
+	push(@command, "-engine", $self->get_param ("ENGINE", %params),
+                       "-keyform", $self->get_param ("KEYFORM", %params))
 		if($self->get_param ("ENGINE", %params));
 
 	push(@command, "-in", $self->{file},
@@ -711,7 +785,15 @@ sub encrypt {
 			$self->{entity} = $oldentity;
 			$self->{file} = $oldfile;
 		}
-		return($self->_setError(8012006, 'OpenCA::OpenSSL::SMIME->encrypt: unknown problem encrypting: $res'));
+		if (not defined $ec)
+                {
+                    $ec  = $self->errno;
+                    $res = $self->errval;
+                }
+		return($self->_setError(8012006,
+                           $self->{gettext} ("OpenCA::OpenSSL::SMIME->encrypt: unknown problem encrypting (__ERRNO__). __ERRVAL__",
+		                             "__ERRNO__", $ec,
+                                             "__ERRVAL__", $res)));
 		return undef;
 	}
 
@@ -729,9 +811,12 @@ sub decrypt {
 	$self->_setError(0, "");
 	$self->_set_status(0, "");
 
-	return($self->_setError(8013001, 'OpenCA::OpenSSL::SMIME->decrypt: Missing required parameter: CERTIFICATE')) unless($params{CERTIFICATE});
-	return($self->_setError(8013002, 'OpenCA::OpenSSL::SMIME->decrypt: Invalid required parameter: CERTIFICATE')) unless(ref($params{CERTIFICATE}));
-	return($self->_setError(8013003, 'OpenCA::OpenSSL::SMIME->decrypt: Missing required parameter: PRIVATE_KEY')) unless($params{PRIVATE_KEY});
+	return($self->_setError(8013001,
+                   $self->{gettext} ("OpenCA::OpenSSL::SMIME->decrypt: Missing required parameter: CERTIFICATE"))) unless($params{CERTIFICATE});
+	return($self->_setError(8013002,
+                   $self->{gettext} ("OpenCA::OpenSSL::SMIME->decrypt: Invalid required parameter: CERTIFICATE"))) unless(ref($params{CERTIFICATE}));
+	return($self->_setError(8013003,
+                   $self->{gettext} ("OpenCA::OpenSSL::SMIME->decrypt: Missing required parameter: PRIVATE_KEY"))) unless($params{PRIVATE_KEY});
 
 	# Set up certificate and key.
 	$certfile = $self->_save_tmp($params{CERTIFICATE}->getPEM())
@@ -750,7 +835,8 @@ sub decrypt {
 	# Create a copy of the headers cache
 	if($self->{headers_cache}) {
 		$oldhead = $self->{headers_cache}->dup()
-			or return($self->_setError(8013004, 'OpenCA::OpenSSL::SMIME->decrypt: Can\'t duplicate headers\' cache for backup'));
+			or return($self->_setError(8013004,
+                                      $self->{gettext} ("OpenCA::OpenSSL::SMIME->decrypt: Can't duplicate headers cache for backup")));
 	}
 
 	# Save headers if necessary.
@@ -763,9 +849,10 @@ sub decrypt {
 
 	my(@command, $outfile);
 	$outfile = $self->_save_tmp("");
-	push(@command, $self->{backend}->{shell}, "smime", "-decrypt");
+	push(@command, "smime", "-decrypt");
 
-	push(@command, "-engine", $self->get_param ("ENGINE", %params))
+	push(@command, "-engine", $self->get_param ("ENGINE", %params),
+                       "-keyform", $self->get_param ("KEYFORM", %params))
 		if($self->get_param ("ENGINE", %params));
 
 	push(@command, "-passin", "env:pwd") if($params{KEY_PASSWORD});
@@ -799,11 +886,15 @@ sub decrypt {
 		} elsif($res =~ /:no recipient matches certificate:/) {
 			$self->_set_status(1301, 'this certificate can\'t decrypt this message');
 		} elsif($res =~ /:no content type:/) {
-			return($self->_setError(8011004, 'OpenCA::OpenSSL::SMIME->verify: found invalid mime stream'));
+			return($self->_setError(8011004,
+                                   $self->{gettext} ("OpenCA::OpenSSL::SMIME->verify: found invalid mime stream")));
 		} elsif($res =~ /:No such file or directory:/) {
-			return($self->_setError(8011005, 'OpenCA::OpenSSL::SMIME->verify: missing file'));
+			return($self->_setError(8011005,
+                                   $self->{gettext} ("OpenCA::OpenSSL::SMIME->verify: missing file")));
 		} else {
-			return($self->_setError(8011006, 'OpenCA::OpenSSL::SMIME->verify: unknown error: '. $res));
+			return($self->_setError(8011006,
+                                   $self->{gettext} ("OpenCA::OpenSSL::SMIME->verify: unknown error: __ERRVAL__",
+                                                     "__ERRVAL__", $res)));
 		}
 		return undef;
 	}
@@ -856,26 +947,21 @@ sub get_mime {
 		}
 	}
 
-	# In scalar context, we're done
+	# // In scalar context, we're done
 	return($newe) unless(wantarray);
 
 	# Save new file
 	($tfh, $newf) = $self->_save_tmp("") or return(undef);
 	$self->{entity}->print($tfh)
-		or return $self->_setError(
-				8014001,
-				'OpenCA::OpenSSL::SMIME->get_mime: ' .
-				'Error saving MIME::Entity into ' .
-				'tempfile');
+		or return $self->_setError(8014001,
+                              $self->{gettext} ("OpenCA::OpenSSL::SMIME->get_mime: Error saving MIME::Entity into tempfile"));
 	$tfh->close
-		or return $self->_setError(
-				8014002,
-				'OpenCA::OpenSSL::SMIME->get_mime: ' .
-				'Error closing tempfile');
+		or return $self->_setError(8014002,
+                              $self->{gettext} ("OpenCA::OpenSSL::SMIME->get_mime: Error closing tempfile"));
 	return($newe, $newf);
 }
 
-# Returns last seen signer's certificate in verify operation
+# // Returns last seen signer's certificate in verify operation
 # FIXME: should know how to handle multiple signers
 sub get_last_signer {
 	my($self) = shift;
@@ -884,8 +970,9 @@ sub get_last_signer {
 	return(undef) unless($self->{last_signer} && -s $self->{last_signer});
 
 	$self->{last_signer_x509} = OpenCA::X509->new(
-			SHELL => $self->{backend},
-			INFILE => $self->{last_signer})
+			SHELL   => $self->{backend},
+                        GETTEXT => $self->{gettext},
+			INFILE  => $self->{last_signer})
 				unless($self->{last_signer_x509});
 	return($self->{last_signer_x509});
 }
@@ -908,254 +995,3 @@ sub status_code {
 1;
 
 __END__
-
-=head1 NAME
-
-OpenCA::OpenSSL::SMIME - Sign, verify, encrypt and decrypt S/MIME
-
-=head1 SYNOPSIS
-
-    $shell = OpenCA::OpenSSL->new();
-    $smime = OpenCA::OpenSSL::SMIME->new(
-		 DATA => \*STDIN,
-		 SHELL => $shell);
-    $smime->sign(CERTIFICATE => $my_x509,
-		 PRIVATE_KEY => $my_key);
-    $mime = $msg->get_mime();
-    $mime->smtpsend();
-
-=head1 DESCRIPTION
-
-A Perl module for handling S/MIME entities: encrypting, decrypting, signing
-and verifying. Uses L<MIME::Entity|MIME::Entity> for easy parsing of complex structures and
-optionally for input and output of data.
-
-=head1 CONSTRUCTORS
-
-=head2 new I<ARGS>
-
-Creates a new I<OpenCA::OpenSSL::SMIME> object.
-If invoked as a instance method, inherits the values of SHELL, CA_CERTS,
-TMPDIR and DEBUG from creator.
-
-Parameters:
-
-=over
-
-=item SHELL
-
-A blessed reference to an L<OpenCA::OpenSSL|OpenCA::OpenSSL> object. Required argument.
-
-=item INFILE
-
-A filename containing MIME data to be processed.
-
-=item DATA
-
-An array reference, a string or a filehandle (as a reference to a glob), containing 
-actual MIME data to be processed
-
-=item ENTITY
-
-A blessed reference to an L<MIME::Entity|MIME::Entity> object to be processed. One of
-DATA or ENTITY should be present.
-
-=item CA_CERTS
-
-Optional list of certificates of CAs for signing and verifying.
-
-Accepts a list of blessed references to L<OpenCA::X509|OpenCA::X509> objects
-
-=item TMPDIR
-
-Sets directory to store various temporary files.
-
-=item DEBUG
-
-Sets debugging on when assigned a true value.
-
-=back
-
-=head1 METHODS
-
-=head2 set_params I<ARGS>
-
-Sets or resets object parameters. Takes the same arguments as new().
-
-=head2 errno
-
-Returns the last error in numeric form.
-Could be called as class method, to retrieve the last error regardless of the instance.
-
-=head2 err
-
-Returns the last error in literal form.
-Could be called as class method, to retrieve the last error regardless of the instance.
-
-=head2 sign I<ARGS>
-
-Signs the message, replaces original content with signed content.
-
-Arguments:
-
-=over
-
-=item CERTIFICATE
-
-Blessed reference to an OpenCA::X509 object containing the signer's certificate.
-
-=item PRIVATE_KEY
-
-The private key of the signer. Should be a string containing the textual data or a open filehandle reference.
-
-=item KEY_PASSWORD
-
-Password to decrypt the private key, if necessary.
-
-=item INCLUDE_CERTS
-
-If true, the signer's certificate and the chain of trust (if present) will be
-included in the message.
-
-=item NO_COPY_HEADERS
-
-If true, the original message headers won't be copied to the external envelope.
-
-=item NO_STRIP_HEADERS
-
-If true, the original message headers won't be stripped off before signing.
-
-=back
-
-=head2 verify I<ARGS>
-
-Verifies the message for integrity and non-repudiation. Can use the embedded
-certificate in the message (if present) or a user-supplied expected signer.
-
-Arguments:
-
-=over
-
-=item USES_EMBEDDED_CERT
-
-If true, uses the certificate included in the message, if any, instead of
-a user-supplied certificate for verifying.
-
-=item CERTIFICATE
-
-Blessed reference to an OpenCA::X509 object containing the user-supplied
-certificate for verifying.
-
-=item NO_COPY_HEADERS
-
-If true, the original message headers won't be copied to the extracted verified message.
-
-=back
-
-=head2 encrypt I<ARGS>
-
-Encrypts the message, replaces original content with crypted content.
-
-Arguments:
-
-=over
-
-=item CERTIFICATE
-
-Blessed reference to an OpenCA::X509 object containing the receiver's certificate.
-
-=item NO_COPY_HEADERS
-
-If true, the original message headers won't be copied to the external envelope.
-
-=item NO_STRIP_HEADERS
-
-If true, the original message headers won't be stripped off before encrypting.
-
-=item CIPHER
-
-Which cipher algorithm to use.
-
-Currently supports:
-des3, des, rc2-40, rc2-64 and rc2-128.
-
-=back
-
-=head2 decrypt I<ARGS>
-
-Decrypts the message, replaces it with original unencrypted data.
-
-Arguments:
-
-=over
-
-=item CERTIFICATE
-
-Blessed reference to an OpenCA::X509 object containing the recipient's certificate.
-
-=item PRIVATE_KEY
-
-The private key of the recipient. Should be a string containing the textual data or a open filehandle reference.
-
-=item KEY_PASSWORD
-
-Password to decrypt the private key, if necessary.
-
-=item NO_COPY_HEADERS
-
-If true, the original message headers won't be copied to the decrypted message.
-
-=back
-
-=head2 get_mime
-
-Extracts the processed message. If called in scalar context, returns a
-MIME::Entity object. In list context, returns a MIME::Entity object and
-a filename containing the textual form of the message.
-
-=head2 get_last_signer
-
-Returns OpenCA::X509 object of embedded certificate from last verify operation,
-if it was successful and contained the signer's certificate.
-
-Returns undef it there wasn't any certificate saved.
-
-=head2 status
-
-Returns status text from last verify/decrypt operation, or undef if it
-was successful.
-
-=head2 status_code
-
-Returns status code from last verify/decrypt operation, or zero if it
-was successful.
-
-NOTE: when status/status_code are set, err/errno are not; and viceversa.
-
-Currently defined status values after verifying:
-
-  1100	message not signed
-  1110	invalid certificate chain
-  1111	no chain of trust supplied
-  1112	certificate has expired
-  1113	certificate is not yet valid
-  1119	unknown certificate problem
-
-Currently defined status values after decrypting:
-
-  1300	message not encrypted
-  1301	this certificate can't decrypt this message
-
-=head1 SEE ALSO
-
-L<OpenCA::OpenSSL|OpenCA::OpenSSL>, L<OpenCA::X509|OpenCA::X509>, L<MIME::Tools|MIME::Tools>, L<MIME::Entity|MIME::Entity>
-
-=head1 AUTHOR
-
-Martín Ferrari <yo@martinferrari.com.ar>.
-
-=head1 VERSION
-
-$Revision: 1.2 $ $Date: 2003/05/05 13:44:50 $
-
-=cut

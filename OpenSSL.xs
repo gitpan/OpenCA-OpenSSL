@@ -4,10 +4,128 @@
 
 #include "ppport.h"
 
+#include <openssl/opensslv.h>
+#include <openssl/opensslconf.h>
+
+#include <openssl/asn1.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
+#include <openssl/rand.h>
+
+static char *prqp_exts[] = {
+        /* PRQP extended key usage - id-kp-PRQPSigning ::= { id-kp 10 }*/
+        "1.3.6.1.5.5.7.3.11", "prqpSigning", "PRQP Signing",
+        /* PRQP PKIX identifier - id-prqp ::= { id-pkix 23 } */
+        "1.3.6.1.5.5.7.23", "PRQP", "PKI Resource Query Protocol",
+        /* PRQP PKIX - PTA identifier - { id-prqp 1 } */
+        "1.3.6.1.5.5.7.23.1", "PTA", "PRQP Trusted Authority",
+        /* PRQP AD id-ad-prqp ::= { id-ad   12 } */
+        "1.3.6.1.5.5.7.48.12", "prqp", "PRQP Service",
+        /* End of the List */
+        NULL, NULL, NULL
+};
+
+static char *prqp_exts_services[] = {
+        "1.3.6.1.5.5.7.48.12.0", "rqa", "PRQP RQA Server",
+        "1.3.6.1.5.5.7.48.12.1", "ocspServer", "OCSP Server",
+        "1.3.6.1.5.5.7.48.12.2", "subjectCert", "Subject Certificate Retieval URI",
+        "1.3.6.1.5.5.7.48.12.3", "issuerCert", "Issuer's Certificate Retieval URI",
+        "1.3.6.1.5.5.7.48.12.4", "timeStamping", "TimeStamping Service",
+        /* PKIX - not yet defined */
+        "1.3.6.1.5.5.7.48.12.5", "scvp", "SCVP Service",
+        "1.3.6.1.5.5.7.48.12.6", "crlDistribution", "Latest CRL URI",
+        "1.3.6.1.5.5.7.48.12.7", "certRepository", "CMS Certificate Repository",
+        "1.3.6.1.5.5.7.48.12.8", "crlRepository", "CMS CRL Repository",
+        "1.3.6.1.5.5.7.48.12.9", "crossCertRepository", "CMS Cross Certificate Repository",
+        /* Gateways */
+        "1.3.6.1.5.5.7.48.12.10", "cmcGateway", "CMC Gateway",
+        "1.3.6.1.5.5.7.48.12.11", "scepGateway", "SCEP Gateway",
+        "1.3.6.1.5.5.7.48.12.12", "htmlGateway", "HTML Gateway",
+        "1.3.6.1.5.5.7.48.12.13", "xkmsGateway", "XKMS Gateway",
+        /* Certificate Policies */
+        "1.3.6.1.5.5.7.48.12.20", "certPolicy", "Certificate Policy (CP) URL",
+        "1.3.6.1.5.5.7.48.12.21", "certPracticeStatement", "Certificate Practices Statement (CPS) URL",
+        "1.3.6.1.5.5.7.48.12.22", "endorsedTA", "CMS Endorsed Trust Anchors",
+        /* Level of Assurance (LOA) */
+        "1.3.6.1.5.5.7.48.12.25", "loaPolicy", "LOA Policy URL",
+        "1.3.6.1.5.5.7.48.12.26", "certLOALevel", "Certificate LOA Modifier URL",
+        /* HTTP (Browsers) based services */
+        "1.3.6.1.5.5.7.48.12.30", "htmlRequest", "HTML Certificate Request Service URL",
+        "1.3.6.1.5.5.7.48.12.31", "htmlRevoke", "HTML Based Certificate Revocation Service URL",
+        "1.3.6.1.5.5.7.48.12.32", "htmlRenew", "HTML Certificate Renewal Service URL",
+        "1.3.6.1.5.5.7.48.12.33", "htmlSuspend", "HTML Certificate Suspension Service",
+        /* Grid Specific Services */
+        "1.3.6.1.5.5.7.48.12.50", "gridAccreditationBody", "CA Accreditation Bodies",
+        "1.3.6.1.5.5.7.48.12.51", "gridAccreditationPolicy", "CA Accreditation Policy Document(s) URL",
+        "1.3.6.1.5.5.7.48.12.52", "gridAccreditationStatus", "CA Accreditation Status Document(s) URL",
+        "1.3.6.1.5.5.7.48.12.53", "gridDistributionUpdate", "Grid Distribution Package(s) URL",
+        "1.3.6.1.5.5.7.48.12.54", "gridAccreditedCACerts", "Certificates of Currently Accredited CAs",
+        /* Trust Anchors Publishing */
+        "1.3.6.1.5.5.7.48.71", "apexTampUpdate", "APEX Trust Anchors Update URL",
+        "1.3.6.1.5.5.7.48.70", "tampUpdate", "Trust Anchors Update URL",
+        /* CA Incident report URL */
+        "1.3.6.1.5.5.7.48.90", "caIncidentReport", "CA Incident Report URL",
+        /* Private Services */
+        "1.3.6.1.5.5.7.48.12.100", "private", "Private Service",
+        NULL, NULL, NULL
+        };
+
+#define SCEP_CONF_LIST_SIZE     8
+
+#define TRANS_ID_SIZE                           16
+
+typedef struct scep_oid_st {
+        int  attr_type;
+        char *oid_s;
+        char *descr;
+        char *long_descr;
+        int  nid;
+} SCEP_CONF_ATTRIBUTE;
+
+/* These should be in the same order than the SCEP_ATTRIBUTE_list in scep_attrs.c */
+typedef enum {
+        SCEP_ATTRIBUTE_MESSAGE_TYPE             = 0,
+        SCEP_ATTRIBUTE_PKI_STATUS,
+        SCEP_ATTRIBUTE_FAIL_INFO,
+        SCEP_ATTRIBUTE_SENDER_NONCE,
+        SCEP_ATTRIBUTE_RECIPIENT_NONCE,
+        SCEP_ATTRIBUTE_TRANS_ID,
+        SCEP_ATTRIBUTE_EXTENSION_REQ,
+        SCEP_ATTRIBUTE_PROXY_AUTH
+} SCEP_ATTRIBUTE_TYPE;
+
+static SCEP_CONF_ATTRIBUTE SCEP_ATTRIBUTE_list [SCEP_CONF_LIST_SIZE] = {
+        { SCEP_ATTRIBUTE_MESSAGE_TYPE, "2.16.840.1.113733.1.9.2",
+                        "scepMessageType", "SCEP Message Type", -1 },
+        { SCEP_ATTRIBUTE_PKI_STATUS, "2.16.840.1.113733.1.9.3",
+                        "pkiStatus", "Status", -1 },
+        { SCEP_ATTRIBUTE_FAIL_INFO, "2.16.840.1.113733.1.9.4",
+                        "failInfo", "Failure Info", -1 },
+        { SCEP_ATTRIBUTE_SENDER_NONCE, "2.16.840.1.113733.1.9.5",
+                        "senderNonce", "Sender Nonce", -1 },
+        { SCEP_ATTRIBUTE_RECIPIENT_NONCE, "2.16.840.1.113733.1.9.6",
+                        "recipientNonce", "Recipient Nonce", -1 },
+        { SCEP_ATTRIBUTE_TRANS_ID, "2.16.840.1.113733.1.9.7",
+                        "transId", "Transaction Identifier", -1 },
+        { SCEP_ATTRIBUTE_EXTENSION_REQ, "2.16.840.1.113733.1.9.8",
+                        "extensionReq", "Extension Request", -1 },
+        { SCEP_ATTRIBUTE_PROXY_AUTH, "1.3.6.1.4.1.4263.5.5",
+                        "proxyAuth", "Proxy Authenticator", -1 },
+};
+
+#if OPENSSL_VERSION_NUMBER < 0x00908000L
+#define OPENSSL_NO_EC
+#endif
+
+#ifndef OPENSSL_NO_EC
+#include <openssl/ec.h>
+#endif
 
 #include "const-c.inc"
+
+#if OPENSSL_VERSION_NUMBER >= 0x10000000L
+typedef _STACK STACK;
+#endif
 
 /* Standard trick to have a C pointer as a Perl object, see the typemap */
 typedef X509          * OpenCA_OpenSSL_X509;
@@ -50,6 +168,9 @@ _new_from_pem(SV * sv)
 	/* load encoded data into bio_in */
 	BIO_write(bio_in, pemcert+27, certlen-27-25);
 
+	/* set EOF for memory bio */
+	BIO_set_mem_eof_return(bio_in, 0);
+
 	/* decode data from one bio into another one */
 	BIO_push(b64, bio_in);
         while((inlen = BIO_read(b64, inbuf, 512)) > 0)
@@ -65,17 +186,80 @@ _new_from_pem(SV * sv)
     OUTPUT:
 	RETVAL
 
-# We do not really support serials that don't fit in one int
-
 int
+init_oids( void )
+    PREINIT:
+	int i, ret;
+        int nid = NID_undef;
+        SCEP_CONF_ATTRIBUTE *curr_oid = NULL;
+    CODE:
+        i = 0;
+        while( prqp_exts[i] && prqp_exts[i+1] ) {
+        	if((ret = OBJ_create(prqp_exts[i], prqp_exts[i+1],
+        				prqp_exts[i+2])) == NID_undef) {
+        		// return 0;
+        	}
+        	i = i+3;
+        }
+        
+        i = 0;
+        while( prqp_exts_services[i] && prqp_exts_services[i+1] ) {
+        	if((ret = OBJ_create(prqp_exts_services[i],
+        		prqp_exts_services[i+1], prqp_exts_services[i+2]))
+        							== NID_undef) {
+        		// return 0;
+        	}
+        	i = i+3;
+        };
+
+        i = 0;
+        while( i < SCEP_CONF_LIST_SIZE ) {
+                curr_oid = &SCEP_ATTRIBUTE_list[i];
+                if(( nid = OBJ_create(curr_oid->oid_s, curr_oid->descr,
+                         	curr_oid->long_descr)) == NID_undef) {
+                        // return 0;
+                }
+
+                curr_oid->nid = nid;
+                i++;
+        }
+
+	RETVAL=1;
+    OUTPUT:
+	RETVAL
+
+char *
 serial(cert)
 	OpenCA_OpenSSL_X509 cert
     PREINIT:
 	char * stringval;
     CODE:
 	stringval = i2s_ASN1_INTEGER(NULL,X509_get_serialNumber(cert));
-	RETVAL = atoi(stringval);
-	free(stringval);
+	RETVAL = stringval;
+    OUTPUT:
+	RETVAL
+
+char *
+hex_serial(cert)
+	OpenCA_OpenSSL_X509 cert
+    PREINIT:
+	ASN1_INTEGER *val;
+	long i, idx;
+	char *retVal;
+    CODE:
+	if((val = X509_get_serialNumber(cert)) != NULL ) {
+		retVal = malloc ( 2 + (val->length * 3) + 1 );
+		idx = 2;
+		sprintf(retVal, "0x");
+		for (i=0; i < val->length; i++) {
+			sprintf( &retVal[idx], "%02x%c", val->data[i], 
+				((i+1 == val->length)?'\x0':':'));
+			idx += 3;
+		}
+		RETVAL=retVal;
+	} else {
+		RETVAL=strdup("0x0");
+	}
     OUTPUT:
 	RETVAL
 
@@ -88,7 +272,26 @@ subject(cert)
 	int n;
     CODE:
 	out = BIO_new(BIO_s_mem());
-	X509_NAME_print_ex(out, X509_get_subject_name(cert), 0, XN_FLAG_RFC2253);
+	X509_NAME_print_ex(out, X509_get_subject_name(cert), 0, XN_FLAG_RFC2253&(~ASN1_STRFLGS_ESC_MSB));
+	n = BIO_get_mem_data(out, &subject);
+	result = (char *) malloc (n+1);
+	result [n] = '\0';
+        memcpy (result, subject, n);
+	RETVAL = result;
+	BIO_free(out);
+    OUTPUT:
+	RETVAL
+
+char *
+openssl_subject(cert)
+	OpenCA_OpenSSL_X509 cert
+    PREINIT:
+	BIO *out;
+	unsigned char *subject, *result;
+	int n;
+    CODE:
+	out = BIO_new(BIO_s_mem());
+	X509_NAME_print_ex(out, X509_get_subject_name(cert), 0, 0);
 	n = BIO_get_mem_data(out, &subject);
 	result = (char *) malloc (n+1);
 	result [n] = '\0';
@@ -107,7 +310,7 @@ issuer(cert)
 	int n;
     CODE:
 	out = BIO_new(BIO_s_mem());
-	X509_NAME_print_ex(out, X509_get_issuer_name(cert), 0, XN_FLAG_RFC2253);
+	X509_NAME_print_ex(out, X509_get_issuer_name(cert), 0, XN_FLAG_RFC2253&(~ASN1_STRFLGS_ESC_MSB));
 	n = BIO_get_mem_data(out, &issuer);
 	result = (char *) malloc (n+1);
 	result [n] = '\0';
@@ -184,11 +387,10 @@ fingerprint (cert, digest_name="sha1")
 		digest = EVP_md5();
 	if (X509_digest(cert,digest,md,&n))
 	{
-		BIO_printf(out, "%s:", OBJ_nid2sn(EVP_MD_type(digest)));
-		for (j=0; j<(int)n; j++)
-		{
-			BIO_printf (out, "%02X",md[j]);
-			if (j+1 != (int)n) BIO_printf(out,":");
+		/* BIO_printf(out, "%s:", OBJ_nid2sn(EVP_MD_type(digest))); */
+		for (j=0; j<(int)n; j++) {
+			BIO_printf (out, "%02x",md[j]);
+			/* if (j+1 != (int)n) BIO_printf(out,":"); */
 		}
 	}
 	n = BIO_get_mem_data(out, &fingerprint);
@@ -293,8 +495,14 @@ pubkey(cert)
 	{
 		if (pkey->type == EVP_PKEY_RSA)
 			RSA_print(out,pkey->pkey.rsa,0);
+#ifndef OPENSSL_NO_DSA
 		else if (pkey->type == EVP_PKEY_DSA)
 			DSA_print(out,pkey->pkey.dsa,0);
+#endif
+#ifndef OPENSSL_NO_EC
+		else if (pkey->type == EVP_PKEY_EC)
+			EC_KEY_print(out, pkey->pkey.ec,0);
+#endif
 		EVP_PKEY_free(pkey);
 	}
 	n = BIO_get_mem_data(out, &pubkey);
@@ -314,13 +522,51 @@ keysize (cert)
 	EVP_PKEY *pkey;
 	unsigned char * pubkey, *result;
 	int n;
+	BIGNUM *priv_key;
+#ifndef OPENSSL_NO_DSA
+	DSA *dsa;
+#endif
+#ifndef OPENSSL_NO_EC
+	EC_KEY *ec;
+#endif
+	RSA *rsa;
     CODE:
 	out = BIO_new(BIO_s_mem());
 	pkey=X509_get_pubkey(cert);
-	if (pkey != NULL)
-	{
-		if (pkey->type == EVP_PKEY_RSA)
-			BIO_printf(out,"%d", BN_num_bits(pkey->pkey.rsa->n));
+	if (pkey != NULL) {
+		if (pkey->type == EVP_PKEY_RSA) {
+			rsa = EVP_PKEY_get1_RSA(pkey);
+			if( rsa ) {
+				BIO_printf(out,"%d", BN_num_bits(rsa->n));
+			} else {
+				BIO_printf(out,"%d", 0);
+			}
+		}
+#ifndef OPENSSL_NO_DSA
+		else if (pkey->type == EVP_PKEY_DSA) {
+			dsa = EVP_PKEY_get1_DSA(pkey);
+			if( dsa ) {
+				BIO_printf(out,"%d", BN_num_bits(dsa->pub_key));
+			} else {
+				BIO_printf(out,"%d", 0);
+			}
+		}
+#endif
+#ifndef OPENSSL_NO_EC
+		else if (pkey->type == EVP_PKEY_EC) {
+			ec = EVP_PKEY_get1_EC_KEY(pkey);
+			if( ec ) {
+				BIO_printf(out, "%d", EVP_PKEY_bits(pkey));
+			} else {
+				BIO_printf(out,"%d", -3);
+			}
+		}
+#endif
+		else {
+			/* Unknown Type! */
+			BIO_printf(out,"%d", 0);
+		}
+
 		EVP_PKEY_free(pkey);
 	}
 	n = BIO_get_mem_data(out, &pubkey);
@@ -343,14 +589,44 @@ modulus (cert)
     CODE:
 	out = BIO_new(BIO_s_mem());
 	pkey=X509_get_pubkey(cert);
-	if (pkey == NULL)
+
+	if (pkey == NULL) {
 		BIO_printf(out,"");
-	else if (pkey->type == EVP_PKEY_RSA)
+	}
+	else if (pkey->type == EVP_PKEY_RSA) {
 		BN_print(out,pkey->pkey.rsa->n);
-	else if (pkey->type == EVP_PKEY_DSA)
+	}
+#ifndef OPENSSL_NO_DSA
+	else if (pkey->type == EVP_PKEY_DSA) {
 		BN_print(out,pkey->pkey.dsa->pub_key);
+	}
+#endif
+#ifndef OPENSSL_NO_EC
+	else if (pkey->type == EVP_PKEY_EC) {
+		EC_KEY *ec;
+		BIGNUM  *pub_key=NULL;
+        	BN_CTX  *ctx=NULL;
+
+	        const EC_GROUP *group;
+	        const EC_POINT *public_key;
+
+		ec = EVP_PKEY_get1_EC_KEY(pkey);
+		if (ec == NULL || (group = EC_KEY_get0_group(ec)) == NULL) {
+			// Nothing happens here!
+                } else {
+
+        		public_key = EC_KEY_get0_public_key(ec);
+        		if ((pub_key = EC_POINT_point2bn(group, public_key,
+                		EC_KEY_get_conv_form(ec), NULL, ctx)) != NULL) {
+
+				BN_print(out, pub_key);
+                	}
+		}
+	}
+#endif
 	else
 		BIO_printf(out,"");
+
 	EVP_PKEY_free(pkey);
 	n = BIO_get_mem_data(out, &modulus);
 	result = (char *) malloc (n+1);
@@ -372,12 +648,16 @@ exponent (cert)
     CODE:
 	out = BIO_new(BIO_s_mem());
 	pkey=X509_get_pubkey(cert);
-	if (pkey == NULL)
+	if (pkey == NULL) {
 		BIO_printf(out,"");
-	else if (pkey->type == EVP_PKEY_RSA)
+	} else if (pkey->type == EVP_PKEY_RSA) {
 		BN_print(out,pkey->pkey.rsa->e);
-	else if (pkey->type == EVP_PKEY_DSA)
+	} 
+#ifndef OPENSSL_NO_DSA
+	else if (pkey->type == EVP_PKEY_DSA) {
 		BN_print(out,pkey->pkey.dsa->pub_key);
+	}
+#endif
 	else
 		BIO_printf(out,"");
 	EVP_PKEY_free(pkey);
@@ -496,6 +776,9 @@ _new_from_pem(SV * sv)
 	/* load encoded data into bio_in */
 	BIO_write(bio_in, pemcrl+25, crllen-25-23);
 
+	/* set EOF for memory bio */
+	BIO_set_mem_eof_return(bio_in, 0);
+
 	/* decode data from one bio into another one */
 	BIO_push(b64, bio_in);
         while((inlen = BIO_read(b64, inbuf, 512)) > 0)
@@ -542,7 +825,7 @@ issuer(crl)
 	int n;
     CODE:
 	out = BIO_new(BIO_s_mem());
-	X509_NAME_print_ex(out, X509_CRL_get_issuer(crl), 0, XN_FLAG_RFC2253);
+	X509_NAME_print_ex(out, X509_CRL_get_issuer(crl), 0, XN_FLAG_RFC2253&(~ASN1_STRFLGS_ESC_MSB));
 	n = BIO_get_mem_data(out, &issuer);
 	result = (char *) malloc (n+1);
 	result [n] = '\0';
@@ -703,6 +986,22 @@ extensions(crl)
 	}
 	RETVAL = result;
 	BIO_free(out);
+    OUTPUT:
+	RETVAL
+
+long
+serial(crl)
+	OpenCA_OpenSSL_CRL crl
+    PREINIT:
+	ASN1_INTEGER *aint;
+    CODE:
+	RETVAL = -1;
+	aint = X509_CRL_get_ext_d2i (crl, NID_crl_number, NULL, NULL);
+	if (aint != NULL)
+        {
+	    RETVAL = ASN1_INTEGER_get (aint);
+            ASN1_INTEGER_free(aint);
+        }
     OUTPUT:
 	RETVAL
 
@@ -962,6 +1261,9 @@ _new_from_pem(SV * sv)
 	/* load encoded data into bio_in */
 	BIO_write(bio_in, pemcsr+36, csrlen-36-34);
 
+	/* set EOF for memory bio */
+	BIO_set_mem_eof_return(bio_in, 0);
+
 	/* decode data from one bio into another one */
 	BIO_push(b64, bio_in);
         while((inlen = BIO_read(b64, inbuf, 512)) > 0)
@@ -1015,7 +1317,7 @@ subject(csr)
 	int n;
     CODE:
 	out = BIO_new(BIO_s_mem());
-	X509_NAME_print_ex(out, csr->req_info->subject, 0, XN_FLAG_RFC2253);
+	X509_NAME_print_ex(out, csr->req_info->subject, 0, XN_FLAG_RFC2253&(~ASN1_STRFLGS_ESC_MSB));
 	n = BIO_get_mem_data(out, &subject);
 	result = (char *) malloc (n+1);
 	result [n] = '\0';
@@ -1131,10 +1433,19 @@ pubkey(csr)
 	pkey=X509_REQ_get_pubkey(csr);
 	if (pkey != NULL)
 	{
-		if (pkey->type == EVP_PKEY_RSA)
+		if (pkey->type == EVP_PKEY_RSA) {
 			RSA_print(out,pkey->pkey.rsa,0);
-		else if (pkey->type == EVP_PKEY_DSA)
+		}
+#ifndef OPENSSL_NO_DSA
+		else if (pkey->type == EVP_PKEY_DSA) {
 			DSA_print(out,pkey->pkey.dsa,0);
+		}
+#endif
+#ifndef OPENSSL_NO_EC
+		else if (pkey->type == EVP_PKEY_EC) {
+			EC_KEY_print(out, pkey->pkey.ec,0);
+		}
+#endif
 		EVP_PKEY_free(pkey);
 	}
 	n = BIO_get_mem_data(out, &pubkey);
@@ -1154,13 +1465,56 @@ keysize (csr)
 	EVP_PKEY *pkey;
 	unsigned char * pubkey, *result;
 	int n;
+	BIGNUM *priv_key;
+	RSA *rsa;
+#ifndef OPENSSL_NO_DSA
+	DSA *dsa;
+#endif
+#ifndef OPENSSL_NO_EC
+	EC_KEY *ec;
+#endif
     CODE:
 	out = BIO_new(BIO_s_mem());
 	pkey=X509_REQ_get_pubkey(csr);
-	if (pkey != NULL)
-	{
-		if (pkey->type == EVP_PKEY_RSA)
-			BIO_printf(out,"%d", BN_num_bits(pkey->pkey.rsa->n));
+	if (pkey != NULL) {
+		if (pkey->type == EVP_PKEY_RSA) {
+			rsa = EVP_PKEY_get1_RSA(pkey);
+			if( rsa ) {
+				BIO_printf(out, "%d", EVP_PKEY_bits(pkey));
+				/* BIO_printf(out,"%d",BN_num_bits(rsa->n));*/
+			} else {
+				BIO_printf(out,"%d", 0);
+			}
+			/* BIO_printf(out,"%d", BN_num_bits(pkey->pkey.rsa->n)); */
+		}
+#ifndef OPENSSL_NO_DSA
+		else if (pkey->type == EVP_PKEY_DSA) {
+			dsa = EVP_PKEY_get1_DSA(pkey);
+			if( dsa ) {
+				BIO_printf(out, "%d", EVP_PKEY_bits(pkey));
+				/*
+				BIO_printf(out,"%d", 
+					BN_num_bits(dsa->pub_key) + 1);
+				*/
+			} else {
+				BIO_printf(out,"%d", 0);
+			}
+		}
+#endif
+#ifndef OPENSSL_NO_EC
+		else if (pkey->type == EVP_PKEY_EC) {
+			ec = EVP_PKEY_get1_EC_KEY(pkey);
+			if( ec ) {
+				BIO_printf(out, "%d", EVP_PKEY_bits(pkey));
+			} else {
+				BIO_printf(out,"%d", -3);
+			}
+		}
+#endif
+		else {
+			/* Unknown Type! */
+			BIO_printf(out,"%d", -1);
+		}
 		EVP_PKEY_free(pkey);
 	}
 	n = BIO_get_mem_data(out, &pubkey);
@@ -1366,3 +1720,55 @@ signature(csr)
 	BIO_free(out);
     OUTPUT:
 	RETVAL
+
+#########################################################################
+MODULE = OpenCA::OpenSSL		PACKAGE = OpenCA::OpenSSL::Misc
+
+char *
+rand_bytes (bytes)
+		int bytes
+	PREINIT:
+		unsigned char seed[20];
+		unsigned char *rnd = NULL;
+		char * ret = NULL;
+		int i = 0;
+		int count = 0;
+	CODE:
+		if ( bytes <= 0 ) {
+			RETVAL = NULL;
+			return;
+		};
+
+        	if (!RAND_pseudo_bytes(seed, 20)) {
+			RETVAL = NULL;
+        	        return;
+        	}
+        	RAND_seed(seed, sizeof seed);
+
+
+		if((rnd = (char *) malloc ( bytes )) == NULL ) {
+			RETVAL = NULL;
+			return;
+		}
+
+		if (!RAND_bytes(rnd, bytes)) {
+			RETVAL = NULL;
+			return;
+		}
+		if((ret = (char *) malloc (bytes * 2 + 1)) == NULL ) {
+			free (rnd);
+			RETVAL = NULL;
+			return;
+		}
+
+		count = 0;
+		for ( i = 0; i < bytes; i++ ) { 
+			sprintf( &ret[count], "%2.2X", rnd[i] );
+			count = count + 2;
+		}
+		ret[bytes*2] = '\x0';
+		free ( rnd );
+		RETVAL = ret;
+	OUTPUT:
+		RETVAL
+

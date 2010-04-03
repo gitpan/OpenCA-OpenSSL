@@ -26,8 +26,8 @@
 ##    documentation and/or other materials provided with the distribution.
 ## 3. All advertising materials mentioning features or use of this software
 ##    must display the following acknowledgement:
-##    "This product includes OpenCA software written by Massimiliano Pala
-##     (madwolf@openca.org) and the OpenCA Group (www.openca.org)"
+## //   "This product includes OpenCA software written by Massimiliano Pala
+## //    (madwolf@openca.org) and the OpenCA Group (www.openca.org)"
 ## 4. If you include any Windows specific code (or a derivative thereof) from 
 ##    some directory (application code) you must include an acknowledgement:
 ##    "This product includes OpenCA software (www.openca.org)"
@@ -82,6 +82,8 @@
 ## getDigest		51
 ## verify		42
 ## sign			43
+## decrypt		46
+## encrypt		47
 ## getCertAttribute	61
 ## getReqAttribute	62
 ## getCRLAttribute	63
@@ -91,6 +93,7 @@
 ## getPIN		53
 ## getOpenSSLDate	54
 ## getNumericDate	55
+## getNumericDateDays	56
 	
 
 use strict;
@@ -103,7 +106,11 @@ use X500::DN;
 use Carp;
 use OpenCA::OpenSSL::SMIME;
 
-($OpenCA::OpenSSL::VERSION = '$Revision: 1.91 $' )=~ s/(?:^.*: (\d+))|(?:\s+\$$)/defined $1?"0\.9":""/eg;
+## i18n stuff needs this
+use Locale::Messages qw (:locale_h :libintl_h);
+use POSIX qw (setlocale);
+
+($OpenCA::OpenSSL::VERSION = '$Revision: 1.29 $' )=~ s/(?:^.*: (\d+))|(?:\s+\$$)/defined $1?"2\.0":""/eg;
 
 ## Global Variables Go HERE
 my %params = (
@@ -113,8 +120,15 @@ my %params = (
 	 baseDir => undef,
 	 verify => undef,
 	 sign => undef,
+	 decrypt => undef,
+	 encrypt => undef,
 	 errno => undef,
-	 errval => undef
+	 errval => undef,
+         OPENSSL => undef,
+         CALLBACK_HANDLER => undef,
+         PIN_CALLBACK => undef,
+         STDERR_CALLBACK => undef,
+         STDOUT_CALLBACK => undef
 );
 
 ## Create an instance of the Class
@@ -140,20 +154,39 @@ sub new {
                 $self->{shell} = "$self->{binDir}/openssl";
         };
 
+	if( not $self->{openca_sv} ) {
+		$self->{openca_sv} = "$self->{binDir}/openca-sv";
+	}
+
 	if( not $self->{verify} ) {
-		$self->{verify} = "$self->{binDir}/openca-verify";
+		$self->{verify} = "$self->{binDir}/openca-sv verify";
 	};
 
 	if( not $self->{sign} ) {
-		$self->{sign} = "$self->{binDir}/openca-sign";
+		$self->{sign} = "$self->{binDir}/openca-sv sign";
+	};
+
+	if( not $self->{decrypt} ) {
+		$self->{decrypt} = "$self->{binDir}/openca-sv decrypt";
+	};
+
+	if( not $self->{encrypt} ) {
+		$self->{encrypt} = "$self->{binDir}/openca-sv encrypt";
 	};
 
 	if( not $self->{tmpDir} ) {
 		$self->{tmpDir} = '/tmp';
 	};
 
-	if( not -e "$self->{shell}" ) {
-		return;
+	if( not $self->{gettext} ) {
+		$self->setError (7700110, "There is no translation function specified.");
+		return undef;
+	};
+
+	if( not -e $self->{openssl} ) {
+		$self->setError (7700120,
+                    $self->{gettext} ("There is no path to OpenSSL specified."));
+		return undef;
 	};
 
 	$self->setError (0, "");
@@ -167,19 +200,72 @@ sub setParams {
 	my $self = shift;
 	my $params = { @_ };
 	my $key;
+	my $rebuild_engine = 0;
+
+	## activate debugging
+        # $self->{DEBUG} = $params->{DEBUG} if (exists $params->{DEBUG});
+        $self->{DEBUG} = 0;
 
 	foreach $key ( keys %{$params} ) {
 
-		$self->{cnf}    = $params->{$key} if ( $key =~ /CONFIG/ );
-		$self->{shell}  = $params->{$key} if ( $key =~ /SHELL/  );
-		$self->{tmpDir} = $params->{$key} if ( $key =~ /TMPDIR/ );
-		$self->{binDir} = $params->{$key} if ( $key =~ /BINDIR/ );
-		$self->{verify} = $params->{$key} if ( $key =~ /VERIFY/ );
-		$self->{sign}   = $params->{$key} if ( $key =~ /SIGN/ );
+		$self->_debug ("setParams: key: $key");
+                $self->_debug ("setParams: value: $params->{$key}");
+
+		$self->{cnf}         = $params->{$key} if ( $key =~ /CONFIG/ );
+		$self->{gettext}     = $params->{$key} if ( $key =~ /GETTEXT/ );
+
+		$self->{openssl}     = $params->{$key} if ( $key =~ /SHELL/  );
+		$self->{wrapper}     = $params->{$key} if ( $key =~ /WRAPPER/ );
+		$self->{ENGINE}      = $params->{$key} if ( $key =~ /^ENGINE/ );
+                $self->{PRE_ENGINE}  = $params->{$key} if ( $key =~ /PRE_ENGINE/ );
+                $self->{POST_ENGINE} = $params->{$key} if ( $key =~ /POST_ENGINE/ );
+                $self->{DYNAMIC_ENGINE}   = $params->{$key} if ( $key =~ /DYNAMIC_ENGINE/ );
+                $self->{CALLBACK_HANDLER} = $params->{$key} if ( $key =~ /CALLBACK_HANDLER/);
+                $self->{GET_PIN_CALLBACK} = $params->{$key} if ( $key =~ /GET_PIN_CALLBACK/);
+                $self->{PIN_CALLBACK}     = $params->{$key} if ( $key =~ /^PIN_CALLBACK/);
+                $self->{STDERR_CALLBACK}  = $params->{$key} if ( $key =~ /STDERR_CALLBACK/);
+                $self->{STDOUT_CALLBACK}  = $params->{$key} if ( $key =~ /STDOUT_CALLBACK/);
+
+		$self->{KEY}         = $params->{$key} if ( $key eq "KEY" );
+		$self->{KEYFORM}     = $params->{$key} if ( $key eq "KEYFORM" );
+		$self->{PASSWD}      = $params->{$key} if ( $key =~ /PASSWD/ );
+		$self->{PEM_CERT}    = $params->{$key} if ( $key =~ /PEM_CERT/ );
+
+		$self->{tmpDir}      = $params->{$key} if ( $key =~ /TMPDIR/ );
+		$self->{binDir}      = $params->{$key} if ( $key =~ /BINDIR/ );
+		if ( $key =~ /OPENCA_SV/ )
+		{
+			$self->{openca_sv} = $params->{$key};
+			$self->{verify}    = $self->{openca_sv}." verify";
+			$self->{sign}      = $self->{openca_sv}." sign";
+			$self->{decrypt}   = $self->{openca_sv}." decrypt";
+			$self->{encrypt}   = $self->{openca_sv}." encrypt";
+			$rebuild_engine    = 1;
+		}
+		$ENV{RANDFILE}  = $params->{$key} if ( $key =~ /RANDFILE/ );
 		$self->{DEBUG}  = $params->{$key} if ( $key =~ /DEBUG/ );
 		open STDERR, $params->{$key} if ( $key =~ /STDERR/ );
-		$self->{$key}   = $params->{$key};
 	}
+
+	$self->{shell} = $self->{openssl};
+
+	# add wrapper to commands that make use of private keys
+	if ((exists $self->{wrapper}) and $self->{wrapper})
+	{
+	    foreach (qw(shell sign decrypt))
+	    {
+		if (exists $self->{$_})
+		{
+		    $self->{$_} = $self->{wrapper} . " " . $self->{$_};
+		}
+	    }
+	}
+
+        # set keyform if engine is in use
+        if ($self->{ENGINE} and not $self->{KEYFORM})
+        {
+            $self->{KEYFORM} = "e";
+        }
 
 	return 1;
 }
@@ -208,14 +294,27 @@ sub setError {
 		$errval	= $_[1];
 	}
 
-	if ($self->{DEBUG}) {
-		print "OpenCA::OpenSSL->setError: errno:".$errno."<br>\n";
-		print "OpenCA::OpenSSL->setError: errval:".$errval."<br>\n";
-	}
+        $self->_debug ("setError: errno: $errno");
+        $self->_debug ("setError: errval: $errval");
 
 	## support for: return $self->setError (1234, "Something fails.") if (not $xyz);
 	return undef;
 }
+
+sub getRandomBytes {
+	my $self = shift;
+	my $bytes = shift;
+	my $ret = undef;
+
+	if ( $bytes <= 0 ) {
+		return undef;
+	}
+
+	$ret = OpenCA::OpenSSL::Misc::rand_bytes ( $bytes );
+
+	return $ret;
+}
+
 
 sub genKey {
 
@@ -229,76 +328,172 @@ sub genKey {
 	my $outfile = $keys->{OUTFILE};
 	$outfile = $self->{KEY} if (not $outfile);
 	my $alg     = $keys->{ALGORITHM};
-	my $type    = $keys->{TYPE};
+	$alg = "aes256" if (not $alg);
+	my $type    = lc($keys->{TYPE});
 	my $passwd  = $keys->{PASSWD};
 	$passwd = $self->{PASSWD} if (not $passwd);
-	## my $engine;
-	## $engine     = ( $ENV{'engine'} or $keys->{ENGINE} ) if ($keys->{USE_ENGINE});
-	my $engine     = ( $ENV{'engine'} or $keys->{ENGINE} );
+	my $engine  = $self->{ENGINE};
 	my $rand    = $keys->{RAND};
 
-	my $command = "$self->{shell} ";
+	## generate the parameter file if necessary
+
+	# $self->{DEBUG} = 1;
+
+        my $param_file = "";
+	if ( lc($type) eq "dsa" ) {
+	    use File::Basename;
+	    $param_file  = $self->{tmpDir};
+            $param_file  = dirname ($outfile) if (dirname ($outfile));
+	    $param_file .= "/dsa_param.$$";
+
+	    my $command = "dsaparam -out $param_file ";
+	    if( $engine ) {
+		$command .= "-engine $engine ";
+            }
+	    if ($bits) {
+                $command .= $bits;
+	        undef $bits;
+            } else {
+                $command .= "2048";
+            }
+
+	    if (not $self->_execute_command (COMMAND => $command, KEY_USAGE => $engine)) {
+		$self->setError (7711005,
+                    $self->{gettext} ("OpenCA::OpenSSL->genKey: Cannot execute command (__ERRNO__). __ERRVAL__",
+                                      "__ERRVAL__", $self->errval,
+                                      "__ERRNO__", $self->errno));
+		return undef;
+	    }
+	}
+
+	## generate the key
+
+	my $command = "";
 
 	if ($type) {
-		$command .= " gen".lc $type." ";
+		$self->_debug ( "genKey -> type is $type!");
+		if( $type =~ /^ecdsa$/i ) {
+			$command .= "ecparam -genkey -noout ";
+		} else {
+			$command .= "gen".lc($type)." ";
+		}
 	} else {
-		$command .= " genrsa ";
+		$command .= "genrsa ";
 	}
 
 	if( $engine ) {
 		$command .= "-engine $engine ";
-	}
+        }
 
-	if( $passwd ) {
+	if( ($passwd) and (lc($type) ne "ecdsa")) {
 		$command .= "-passout env:pwd ";
-		$alg = "des" if ( not(defined($alg)) or $alg eq "" );
-	}
+		$alg = "aes256 " if ( not(defined($alg)) or $alg eq "" );
 
-	if ( defined($alg) && $alg ne "" ) {
-		$command .= "-$alg ";
+		if ( defined($alg) && $alg ne "" ) {
+			$command .= "-$alg ";
+		}
 	}
 
 	if ( defined($outfile) && $outfile ne "" ) {
 		$command .= "-out $outfile ";
 	}
 
-
 	if ( defined($rand) && $rand ne "" ) {
-		$command .= "-rand \Q$rand\E ";
+		$command .= "-rand $rand ";
 	} else {
-		$ENV{'RANDFILE'} = "/tmp/.rand_${$}";
+		$ENV{'RANDFILE'} = $self->{tmpDir}."/.rand_${$}";
 	}
 
-	$command .= $bits if( defined($bits) );
+	if ($param_file) {
+		## DSA
+		$command .= $param_file;
+	} elsif ( $type =~ /^ecdsa$/i ) {
+		if( defined($bits) ) {
+			if ( $bits <= 112 ) {
+				$command .= " -name secp112r1 ";
+			} elsif ( $bits <= 128 ) {
+				$command .= " -name secp128r1 ";
+			} elsif ( $bits <= 160 ) {
+				$command .= " -name secp160r1 ";
+			} elsif ( $bits <= 192 ) {
+				$command .= " -name prime192v1 ";
+			} elsif ( $bits <= 224 ) {
+				$command .= " -name secp224r1 ";
+			} elsif ( $bits <= 256 ) {
+				$command .= " -name prime256v1 ";
+			} elsif ( $bits <= 384 ) {
+				$command .= " -name secp384r1 ";
+			} elsif ( $bits <= 521 ) {
+				$command .= " -name secp521r1 ";
+			} else {
+				#not supported, let's default to 224
+				$command .= " -name secp224r1 ";
+				$self->setError (7711006,
+                    			$self->{gettext} ("OpenCA::OpenSSL->genKey: You must specify a key length less or equal to 521 for ECDSA keys."));
+				$self->_debug ( "genKey -> ERROR::type is ECDSA but bits is $bits!");
+				return undef;
+			}
+		} else {
+			$self->setError (7711007,
+                    		$self->{gettext} ("OpenCA::OpenSSL->genKey: You must specify a key length for ECDSA keys."));
+				$self->_debug ( "genKey -> ERROR::type is ECDSA but bits is not defined ($bits)!");
+			return undef;
+		}
 
-	## FIXME: why do we open a pipe and don't pass any data?
+        } elsif (defined($bits)) {
+		## RSA
+		$command .= $bits;
+        } else {
+		$self->setError (7711008,
+                    $self->{gettext} ("OpenCA::OpenSSL->genKey: You must specify a parameterfile for DSA or a the key length for RSA keys."));
+		return undef;
+        }
+
+	$self->_debug ( "genKey -> INFO::Command is ($command)");
 
 	$ENV{'pwd'} = "$passwd" if (defined($passwd));
-	if (not open(FD, "$command|" )) {
-		$self->setError (7711011, "OpenCA::OpenSSL->genKey: Cannot open pipe to OpenSSL.");
+	if (not $self->_execute_command (COMMAND => $command, KEY_USAGE => $engine)) {
+		$self->setError (7711011,
+                    $self->{gettext} ("OpenCA::OpenSSL->genKey: Cannot execute command (__ERRNO__). __ERRVAL__" . "(__COMMAND__)",
+                                      "__ERRVAL__", $self->errval,
+                                      "__ERRNO__", $self->errno),
+				      "__COMMAND__", $command );
 		delete ($ENV{'pwd'}) if( defined($passwd));
 		return undef;
 	}
-	## Send Password
-	## if( $passwd ) {
-	## 	print FD "$passwd\n";
-	## }
 
-	## Send Confirmation Password
-	## print FD "$passwd\n";
-	close(FD);
+	if( ($passwd) and (lc($type) eq "ecdsa" )) {
+		my $encCommand = "";
 
-	delete ($ENV{'pwd'}) if( defined($passwd));
+		$encCommand = "ec ";
+		$encCommand .= "-passout env:pwd ";
+		if( $alg ne "" ) {
+			$encCommand .= "-ecdsa ";
+		};
+
+		if ( $outfile ne "" ) {
+			$encCommand .= "-in \"$outfile\" -out \"$outfile\"";
+		}
+
+		$self->_execute_command( COMMAND => $encCommand,
+				KEY_USAGE => $engine );
+	}
+
+	delete ($ENV{'pwd'})      if( defined($passwd));
 	delete ($ENV{'RANDFILE'}) if (defined($ENV{'RANDFILE'}));
 
 	if( not defined( $rand )) {
-		unlink( "/tmp/.rand_${$}" );
+		unlink( $self->{tmpDir}."/.rand_${$}" );
 	}
 
 	if( $? != 0 ) {
-		$self->setError (7711021, "OpenCA::OpenSSL->genKey: OpenSSL fails (".$?.").");
+		$self->setError (7711021,
+                    $self->{gettext} ("OpenCA::OpenSSL->genKey: OpenSSL fails (__ERRNO__).",
+                                      "__ERRNO__", $?));
 		return undef;
 	}
+
+	$self->{DEBUG} = 0;
 
 	return 1;
 }
@@ -312,56 +507,76 @@ sub genReq {
 	my $self = shift;
 	my $keys = { @_ };
 
-	## my $engine;
-	## $engine     = ( $ENV{'engine'} or $keys->{ENGINE} ) if ($keys->{USE_ENGINE});
-	my $engine     = ( $ENV{'engine'} or $keys->{ENGINE} );
+	my $engine = $self->{ENGINE};
 
 	my $outfile = $keys->{OUTFILE};
 	my $outform = $keys->{OUTFORM};
 	my $keyfile = $keys->{KEYFILE};
 	$keyfile = $self->{KEY} if (not $keyfile);
 	my $subject = $keys->{SUBJECT};
+	my $noemaildn = $keys->{NOEMAILDN};
 	my $passwd  = $keys->{PASSWD};
+	my $extensions = $keys->{EXTENSIONS};
 	$passwd = $self->{PASSWD} if (not $passwd);
-	my $command = "$self->{shell} req -new ";
+	my $command = "req -new ";
 	my $tmpfile = $self->{tmpDir} . "/${$}_req.pem";
-	my ( $ret, $tmp, @DN );
+	my ( $ret, $tmp );
 
 	if( not $keyfile ) {
-		$self->setError (7712011, "OpenCA::OpenSSL->genReq: No keyfile specified.");
+		$self->setError (7712011,
+                    $self->{gettext} ("OpenCA::OpenSSL->genReq: No keyfile specified."));
 		return undef;
 	}
 
-	if( defined $keys->{DN} ) {
-		@DN = @{ $keys->{DN} };
-	}
-
-	## fix openssl's DN-handling
+	## fix DN-handling of OpenSSL
 	if ($subject) {
-		print "OpenCA::OpenSSL->genReq: subject_rfc2253: $subject<br>\n"
-			if ($self->{DEBUG});
+		$subject =~ s/\w+=\s*\,//g;
+		$subject =~ s/\w+=\s*$//;
+		# $self->setError(7712014,"NEW SUBJECT => $subject");
+		# return undef;
+
+                $self->_debug ("genReq: subject_rfc2253: $subject");
 		my $dn_obj = X500::DN->ParseRFC2253 ($subject);
 		if (not $dn_obj) {
 			$self->setError (7712013,
-					"OpenCA::OpenSSL->genReq: Cannot build X500::DN-object from subject $subject.");
+			    $self->{gettext} ("OpenCA::OpenSSL->genReq: Cannot build X500::DN-object from subject __SUBJECT__",
+                                              "__SUBJECT__", $subject));
 			return undef;
 		}
 		$subject = $dn_obj->getOpenSSLString ();
-		print "OpenCA::OpenSSL->genReq: subject_x500: $subject<br>\n"
-			if ($self->{DEBUG});
-	}
+                $self->_debug ("genReq: subject_x500: $subject");
+	} else {
+                $self->_debug ("genReq: the subject of the request is not defined");
+		$self->setError (7712015,
+                    $self->{gettext} ("OpenCA::OpenSSL->genReq: The subject of the request is not defined."));
+		return undef;
+        }
 
  	if ( defined($self->{cnf}) && $self->{cnf} ne "" ) {
 		$command .= "-config " . $self->{cnf} . " ";
 	}
 
- 	$command .= "-passin env:pwd " if ( defined($passwd) && $passwd ne "" );
-	$command .= "-subj \Q$subject\E " if ( defined( $subject) && $subject ne "" );
+	if (not $self->{PIN_CALLBACK} and not $self->{GET_PIN_CALLBACK})
+	{
+	 	$command .= "-passin env:pwd " if ( defined($passwd) && $passwd ne "" );
+	}
+
+	if( $keys->{NOEMAILDN} ) {
+	 	$subject =~ s/emailAddress=[^\/\,]+\,*\/*//gi;
+	 	$subject =~ s/(\,*|\/*)$//;
+	 	$subject =~ s/^\/\//\//;
+	};
+
+	$command .= "-subj \"$subject\" ";
+        $command .= "-multivalue-rdn " if ($subject =~ /[^\\](\\\\)*\+/);
 
 	if( $engine ) {
-                $command .= "-engine $engine ";
+                $command .= "-engine $engine -keyform ".$self->{KEYFORM}." ";
         }
 
+	if( $extensions ) {
+		$command .= "-reqexts \"$extensions\" ";
+	}
 
 	if( defined($outform) ) {
 		$outform = uc( $outform );
@@ -378,41 +593,25 @@ sub genReq {
 	if ( $outfile ne "" ) {
 		$command .= "-out $outfile ";
 	} else {
-		$command .= " >$tmpfile ";
+		$command .= " -out $tmpfile ";
 	}
 	
 	$ENV{'pwd'} = "$passwd" if( defined($passwd));
-	print "OpenCA::OpenSSL->genReq: command: ".$command."<br>\n"
-		if ($self->{DEBUG});
-	if (not open( FD, "|$command" )) {
-		$self->setError (7712071, "OpenCA::OpenSSL->genReq: Cannot open pipe to OpenSSL.");
+	if (not $self->_execute_command (COMMAND => $command, KEY_USAGE => $engine)) {
+		$self->setError (7712071,
+                    $self->{gettext} ("OpenCA::OpenSSL->genReq: Cannot execute command (__ERRNO__). __ERRVAL__",
+                                      "__ERRVAL__", $self->errval,
+                                      "__ERRNO__",  $self->errno));
 		delete( $ENV{'pwd'} ) if( defined($passwd) );
 		return undef;
 	}
-	if( not defined ($subject) or ( $subject eq "") ) {
-		foreach $tmp (@DN) {
-			print FD "$tmp\n";
-		}
-	}
-	close(FD);
 	delete( $ENV{'pwd'} ) if( defined($passwd) );
-
-	if ($? == 256) {
-		if ($self->{DEBUG}) {
-			print "OpenCA::OpenSSL->genReq: error detected<br>\n";
-			print "OpenCA::OpenSSL->genReq: original errorcode: ".$?."<br>\n";
-			print "OpenCA::OpenSSL->genReq: deleting error<br>\n";
-		}
-		$? = 0;
-	}
-	if( $? != 0 ) {
-		$self->setError (7712073, "OpenCA::OpenSSL->genReq: OpenSSL fails (".$?.").");
-		return undef;
-	}
 
 	if( not defined $outfile or $outfile eq "" ) {
 		if (not open( FD, "<$tmpfile" )) {
-			$self->setError (7712081, "OpenCA::OpenSSL->genReq: Cannot open tmpfile $tmpfile for reading.");
+			$self->setError (7712081,
+                            $self->{gettext} ("OpenCA::OpenSSL->genReq: Cannot open tmpfile __FILENAME__ for reading.",
+                                              "__FILENAME__", $tmpfile));
 			return undef;
 		}
 		while( $tmp = <FD> ) {
@@ -448,50 +647,67 @@ sub genCert {
 	my $days    = $keys->{DAYS};
 	my $tmpfile = $self->{tmpDir} . "/${$}_crt.tmp";
 
-	## my $engine;
-	## $engine     = ( $ENV{'engine'} or $keys->{ENGINE} ) if ($keys->{USE_ENGINE});
-	my $engine     = ( $ENV{'engine'} or $keys->{ENGINE} );
+	my $engine  = $self->{ENGINE};
 
-	## fix openssl's DN-handling
+	my $extfile = $keys->{EXTFILE};
+	my $extensions  = $keys->{EXTENSIONS};
+
+	## fix DN-handling of OpenSSL
 	if ($subject) {
-		print "OpenCA::OpenSSL->genReq: subject_rfc2253: $subject<br>\n"
-			if ($self->{DEBUG});
+		$subject =~ s/\w+=\s*\,//g;
+		$subject =~ s/\w+=\s*$//;
+		# $self->setError(7712014,"NEW SUBJECT => $subject");
+		# return undef;
+
+                $self->_debug ("genReq: subject_rfc2253: $subject");
 		my $dn_obj = X500::DN->ParseRFC2253 ($subject);
 		if (not $dn_obj) {
 			$self->setError (7713013,
-					"OpenCA::OpenSSL->genCert: Cannot build X500::DN-object from subject $subject.");
+			    $self->{gettext} ("OpenCA::OpenSSL->genCert: Cannot build X500::DN-object from subject __SUBJECT__.",
+                                              "__SUBJECT__", $subject));
 			return undef;
 		}
 		$subject = $dn_obj->getOpenSSLString ();
-		print "OpenCA::OpenSSL->genReq: subject_x500: $subject<br>\n"
-			if ($self->{DEBUG});
+                $self->_debug ("genReq: subject_x500: $subject");
 	}
 
-	my $command = "$self->{shell} req -x509 ";
+	my $command = "ca -batch -selfsign ";
 
 	my ( $ret, $tmp );
 
 	if (not $keyfile) {
-		$self->setError (7713015, "OpenCA::OpenSSL->genCert: No keyfile specified.");
+		$self->setError (7713015,
+                    $self->{gettext} ("OpenCA::OpenSSL->genCert: No keyfile specified."));
 		return undef;
 	}
 	if (not $reqfile) {
-		$self->setError (7713016, "OpenCA::OpenSSL->genCert: No requestfile specified.");
+		$self->setError (7713016,
+                    $self->{gettext} ("OpenCA::OpenSSL->genCert: No requestfile specified."));
 		return undef;
 	}
 
         if( $engine ) {
-                $command .= "-engine $engine ";
+                $command .= "-engine $engine -keyform ".$self->{KEYFORM}." ";
         }
 
-	$command .= "-subj \Q$subject\E "
-		if ( defined($subject) && ($subject ne "") );
+	if ( defined($subject) && ($subject ne "") ) {
 
-	## $command .= "-noemailDN "
-	## 	if ( defined($noemail) && ($noemail ne "") );
+		# if( $keys->{NOEMAILDN} ) {
+		 # 	$subject =~ s/emailAddress=[^\/\,]+\,*\/*//gi;
+		 # 	$subject =~ s/(\,*|\/*)$//;
+		 # 	$subject =~ s/^\/\//\//;
+		# };
 
-	$command .= "-passin env:pwd " 
-		if ( defined($passwd) && $passwd ne "" );
+		$command .= " -subj \"$subject\" ";
+	};
+
+        $command .= "-multivalue-rdn " if ($subject and $subject =~ /[^\\](\\\\)*\+/);
+
+	if (not $self->{PIN_CALLBACK} and not $self->{GET_PIN_CALLBACK})
+	{
+		$command .= "-passin env:pwd " 
+			if ( defined($passwd) && $passwd ne "" );
+	}
 
 	$command .= "-config ". $self->{cnf} . " "
 		if ( defined($self->{'cnf'}) && $self->{cnf} ne "" );
@@ -499,27 +715,37 @@ sub genCert {
 	$command .= "-days $days " 
 		if ( defined($days) && $days =~ /\d+/ && $days > 0 );
 
-	$command .= "-in \Q$reqfile\E -key \Q$keyfile\E ";
+	$command .= "-in \"$reqfile\" -keyfile \"$keyfile\" ";
 
+	$command .= "-extensions \"" . $extensions . "\" " if( $extensions );
+	$command .= qq{ -extfile "$extfile" } if ( $extfile );
 
 	if( defined($outfile) && $outfile ne "" ) {
-		$command .= "-out \Q$outfile\E ";
+		$command .= "-out \"$outfile\" ";
 	} else {
-		$command .= "-out \Q$tmpfile\E ";
+		$command .= "-out \"$tmpfile\" ";
 	}
 
 	$ENV{'pwd'} = "$passwd" if( defined($passwd) );
-	$ret = `$command`;
+
+        $ret = $self->_execute_command (COMMAND => $command, 
+						KEY_USAGE => $engine);
+
 	delete( $ENV{'pwd'} ) if( defined($passwd) );
 
-	if( $? != 0 ) {
-		$self->setError (7713071, "OpenCA::OpenSSL->genCert: OpenSSL failed (".$?.").");
+	if( not $ret ) {
+		$self->setError (7713071,
+                    $self->{gettext} ("OpenCA::OpenSSL->genCert: OpenSSL failed (__ERRNO__). __ERRVAL__",
+                                      "__ERRNO__", $self->errno,
+                                      "__ERRVAL__", $self->errval));
 		return undef;
 	}
 
 	if( not(defined($outfile)) or $outfile eq "" ) {
 		if (not open( FD, "<$tmpfile" )) {
-			$self->setError (7713081, "OpenCA::OpenSSL->genCert: Cannot open tmpfile $tmpfile for reading.");
+			$self->setError (7713081,
+                            $self->{gettext} ("OpenCA::OpenSSL->genCert: Cannot open tmpfile __FILENAME__ for reading.",
+                                              "__FILENAME__", $tmpfile));
 			return undef;
 		}
 		while( $tmp = <FD> ) {
@@ -543,7 +769,7 @@ sub crl2pkcs7 {
 	my $outform = $keys->{OUTFORM};
 
 	my ( $ret, $tmp, $tmpfile, $command, $nocrl );
-	$command = "$self->{shell} crl2pkcs7 ";
+	$command = "crl2pkcs7 ";
 
 	if( (not(defined($data)) or $data eq "") and
 			(not(defined($crlfile)) or $crlfile eq "" )) {
@@ -556,7 +782,9 @@ sub crl2pkcs7 {
 	if ( not defined $crlfile or $crlfile eq "" ){
 		$tmpfile = $self->{tmpDir} . "/${$}_incrl.tmp";
 		if (not open( FD, ">$tmpfile" )) {
-			$self->setError (7721011, "OpenCA::OpenSSL->crl2pkcs7: Cannot open tmpfile $tmpfile for writing.");
+			$self->setError (7721011,
+                            $self->{gettext} ("OpenCA::OpenSSL->crl2pkcs7: Cannot open tmpfile __FILENAME__ for writing.",
+                                              "__FILENAME__", $tmpfile));
 			return undef;
 		}
 		print FD "$data";
@@ -577,14 +805,17 @@ sub crl2pkcs7 {
 		my @certs = @{ $keys->{CERTSLIST}};
 
 		for (@certs) {
-			$command .= "-certfile \Q$_\E "
+			$command .= "-certfile $_ "
 				if( ("$_" ne "") and (-f "$_") );
 		}
 	}
 
-	$ret = `$command`;
-	if($? != 0) {
-		$self->setError (7721071, "OpenCA::OpenSSL->crl2pkcs7: OpenSSL fails (".$?.").");
+	$ret = $self->_execute_command (COMMAND => $command);
+	if(not $ret) {
+		$self->setError (7721071,
+                    $self->{gettext} ("OpenCA::OpenSSL->crl2pkcs7: OpenSSL fails (__ERRNO__). __ERRVAL__",
+                                      "__ERRNO__", $self->errno,
+                                      "__ERRVAL__", $self->errval));
 		$ret = undef;
 	} else {
 		$ret = 1 if( $outfile ne "" );
@@ -644,14 +875,16 @@ sub dataConvert {
 	my $keyfile = $keys->{KEYFILE};
 	$keyfile = $self->{KEY} if (not $keyfile);
 	my $passwd  = $keys->{'PASSWD'};
-	$passwd = $self->{PASSWD} if (not $passwd);
+	$passwd = $self->{PASSWD} if (not $passwd and
+	                              not exists $keys->{'OUTPASSWD'} and
+	                              not exists $keys->{'INPASSWD'});
 	my $p12pass = $keys->{'P12PASSWD'};
 	my $inpwd   = $keys->{'INPASSWD'};
 	my $outpwd  = $keys->{'OUTPASSWD'};
 	my $algo    = $keys->{'ALGO'} || 'des3';
 	my $nokeys  = $keys->{'NOKEYS'};
 	my $cacert  = $keys->{'CACERT'};
-	$cacert = $self->{CERT} if (not $cacert);
+	$cacert = $self->{PEM_CERT} if (not $cacert);
 	my $pubin   = $keys->{'PUBIN'};
 	my $pubout  = $keys->{'PUBOUT'};
 
@@ -659,54 +892,54 @@ sub dataConvert {
 
 	## rest errordetection
 	if( $? != 0 ) {
-		print "OpenCA::OpenSSL->dataConvert: resetting error from ${?} to 0<br>\n"
-			if ($self->{DEBUG});
+                $self->_debug ("dataConvert: resetting error from ${?} to 0.");
 		$? = 0;
 	}
 	if( $errno != 0 ) {
-		print "OpenCA::OpenSSL->dataConvert: resetting errno from $errno to 0<br>\n"
-			if ($self->{DEBUG});
+                $self->_debug ("dataConvert: resetting errno from $errno to 0.");
 		$self->setError (0, "");
 	}
 
 	if ( not $type) {
-		$self->setError (7722011, "OpenCA::OpenSSL->dataConvert: No datatype specified.");
+		$self->setError (7722011,
+                    $self->{gettext} ("OpenCA::OpenSSL->dataConvert: No datatype specified."));
 		return undef;
 	}
 	if ( (not $data) and (not $infile) and ($type =~ /KEY/)) {
 		$infile = $self->{KEY};
 	}
 	if ( (not $data) and (not $infile)) {
-		$self->setError (7722012, "OpenCA::OpenSSL->dataConvert: No input data specified.");
+		$self->setError (7722012,
+                    $self->{gettext} ("OpenCA::OpenSSL->dataConvert: No input data specified."));
 		return undef;
 	}
 	if ( not $algo =~ /des3|des|idea/ ) {
-		$self->setError (7722013, "OpenCA::OpenSSL->dataConvert: Unsupported algorithm specified.");
+		$self->setError (7722013,
+                    $self->{gettext} ("OpenCA::OpenSSL->dataConvert: Unsupported algorithm specified."));
 		return undef;
 	}
 	if ( defined($nokeys) and ($outform eq 'PKCS12') ) {
 		$self->setError (7722014,
-				"OpenCA::OpenSSL->dataConvert: No keys available but the output format is PKCS#12.");
+		    $self->{gettext} ("OpenCA::OpenSSL->dataConvert: No keys available but the output format is PKCS#12."));
 		return undef;
 	}
 
 	## Return if $infile does not exists
 	if( $infile and ( not -e $infile )) {
-		$self->setError (7722015, "OpenCA::OpenSSL->dataConvert: The specified inputfile doesn't exist.");
+		$self->setError (7722015,
+                    $self->{gettext} ("OpenCA::OpenSSL->dataConvert: The specified inputfile doesn't exist."));
 		return undef;
 	}
 	if (not $infile) {
 		$infile = $self->{tmpDir} . "/${$}_data.tmp";
-		if ($self->{DEBUG}) {
-			print "OpenCA::OpenSSL->dataConvert: create temporary infile $infile<br>\n";
-			print "OpenCA::OpenSSL->dataConvert: the data is like follows<br>\n";
-			print "$data<br>\n";
-		}
+                $self->_debug ("dataConvert: create temporary infile $infile");
+                $self->_debug ("dataConvert: the data is like follows");
+                $self->_debug ("dataConvert: $data");
 		if (not  open FD, ">".$infile) {
-			print "OpenCA::OpenSSL->dataConvert: failed to open temporary infile $infile<br<\n"
-				if ($self->{DEBUG});
+                        $self->_debug ("dataConvert: failed to open temporary infile $infile");
 			$self->setError (7722041,
-					"OpenCA::OpenSSL->dataConvert: Cannot write inputdata to tmpfile $infile.");
+			    $self->{gettext} ("OpenCA::OpenSSL->dataConvert: Cannot write inputdata to tmpfile __FILENAME__.",
+                                              "__FILENAME__", $infile));
 			return undef;
 		}
 		print FD $data;
@@ -719,18 +952,18 @@ sub dataConvert {
 	$inform  = "PEM" if( not $inform ); 
 
 	$tmpfile = "$self->{tmpDir}/${$}_cnv.tmp";
-	$command = "$self->{shell} ";
+	$command = "";
 
 	if( $type =~ /CRL/i ) {
-		$command .= " crl ";
+		$command .= "crl ";
 	} elsif ( $type =~ /CERTIFICATE/i ) {
 		if( $outform eq 'PKCS12' or $inform eq 'PKCS12' ) {
-			$command .= ' pkcs12 ';
+			$command .= 'pkcs12 ';
 		} else {
-			$command .= " x509 -nameopt RFC2253 ";
+			$command .= "x509 -nameopt RFC2253,-esc_msb ";
 		}
 	} elsif ( $type =~ /REQ/i ) {
-		$command .= " req -nameopt RFC2253 ";
+		$command .= "req -nameopt RFC2253,-esc_msb ";
  		if ( defined($self->{cnf}) && $self->{cnf} ne "" ) {
 			$command .= "-config " . $self->{cnf} . " ";
 		}
@@ -738,9 +971,9 @@ sub dataConvert {
 		## PKCS8 enforces PEM because the OpenSSL command req can
 		## only handle PEM-encoded PKCS#8 keys
 		if ( ($outform =~ /PKCS8/i) or ($inform =~ /PKCS8/i) ) {
-			$command .= " pkcs8 ";
+			$command .= "pkcs8 ";
 		} else {
-			$command .= " rsa ";
+			$command .= "rsa ";
 		}
 		if ( $pubout ) {
 			$command .= " -pubout ";
@@ -778,7 +1011,7 @@ sub dataConvert {
 	} else {
 		## if no known type is given...
 		$self->setError (7722021,
-				"OpenCA::OpenSSL->dataConvert: The datatype which should be converted is not known.");
+		    $self->{gettext} ("OpenCA::OpenSSL->dataConvert: The datatype which should be converted is not known."));
 		unlink ($infile) if ($data);
 		return undef;
 	}
@@ -791,7 +1024,10 @@ sub dataConvert {
 
 	# outform in PKCS12 is always PEM
 	if( $outform =~ /TXT/i ) {
-		$command .= "-text -noout ";
+		## FIXME: noout was removed because of a bug in OpenSSL 0.9.7
+		## FIXME: the crl command returns an error if -noout is in use
+		## $command .= "-text -noout ";
+		$command .= "-text ";
 	} elsif ( $outform =~ /(PEM|DER|NET)/i ) {
 		if( $inform eq 'PKCS12' ) {
 			$command .= '-passout env:pempwd 'if( defined($passwd) );
@@ -814,6 +1050,7 @@ sub dataConvert {
 		$command .= "-certfile $cacert " if(defined($cacert));
 	} elsif ( $outform =~ /PKCS8/i ) {
 		$command .= " -topk8 ";
+		$command .= " -nocrypt " if (not $outpwd);
 		if ($encoding) {
 			$command .= " -outform ".uc($encoding)." ";
 		} else {
@@ -821,11 +1058,10 @@ sub dataConvert {
 		}
 	} else {
 		## no valid format received...
-		print "OpenCA::OpenSSL->dataConvert: failed to determine the output format ($outform)<br>\n"
-			if ($self->{DEBUG});
+                $self->_debug ("dataConvert: failed to determine the output format ($outform)");
 		unlink ($infile) if ($data);
 		$self->setError (7722024,
-				"OpenCA::OpenSSL->dataConvert: The output format is unknown or unsupported.");
+		    $self->{gettext} ("OpenCA::OpenSSL->dataConvert: The output format is unknown or unsupported."));
 		return undef;
 	}
 
@@ -838,27 +1074,24 @@ sub dataConvert {
 	 		# nothing to do here.
 		} else {
 			## no valid format received ...
-			print "OpenCA::OpenSSL->dataConvert: failed to determine the input format ($inform)<br>\n"
-				if ($self->{DEBUG});
+                        $self->_debug ("dataConvert: failed to determine the input format ($inform)");
 			unlink ($infile) if ($data);
 			$self->setError (7722026,
-					"OpenCA::OpenSSL->dataConvert: You don't try to convert to PKCS#12 but the".
-					" input format is unknown or unsupported.");
+			    $self->{gettext} ("OpenCA::OpenSSL->dataConvert: You don't try to convert to PKCS#12 but the input format is unknown or unsupported."));
 			return undef;
 		}
 	}
 
-	if ($self->{DEBUG}) {
-		print "OpenCA::OpenSSL->dataConvert: p12pass is set<br>\n" if( defined($p12pass) );
-		print "OpenCA::OpenSSL->dataConvert: passwd is set<br>\n" if( defined($passwd) );
-		print "OpenCA::OpenSSL->dataConvert: inpwd is set<br>\n" if( defined($inpwd) );
-		print "OpenCA::OpenSSL->dataConvert: outpwd is set<br>\n" if( defined($outpwd) );
-		print "OpenCA::OpenSSL->dataConvert: command=\Q$command\E<br>\n";
-	}
+        $self->_debug ("dataConvert: p12pass is set") if( defined($p12pass) );
+        $self->_debug ("dataConvert: passwd is set")  if( defined($passwd) );
+        $self->_debug ("dataConvert: inpwd is set")   if( defined($inpwd) );
+        $self->_debug ("dataConvert: outpwd is set")  if( defined($outpwd) );
+        $self->_debug ("dataConvert: command=$command");
 
 	if( $? != 0 ) {
-		$self->setError (7722069, "OpenCA::OpenSSL->dataConvert: ".
-				"Unkown Error detected before OpenSSL starts (".$?.").");
+		$self->setError (7722069,
+                    $self->{gettext} ("OpenCA::OpenSSL->dataConvert: Unkown Error detected before OpenSSL starts (__ERRNO__)",
+                                      "__ERRNO__", $?));
 		unlink ($infile) if ($data);
 		return undef;
 	}
@@ -869,60 +1102,45 @@ sub dataConvert {
 	$ENV{'outpwd'} = "$outpwd"  if( defined($outpwd) );
 
 	if( defined($infile) && $infile ne "" ) {
-		print "OpenCA::OpenSSL->dataConvert: using infile<br>\n" if ($self->{DEBUG});
-		$ret=`$command`;
+                $self->_debug ("dataConvert: using infile");
+		$ret=$self->_execute_command (COMMAND => $command);
 	} else {
-		print "OpenCA::OpenSSL->dataConvert: piping data<br>\n" if ($self->{DEBUG});
-		print "OpenCA::OpenSSL->dataConvert: data<br>\n$data<br>\n" if ($self->{DEBUG});
-		if (not open( FD, "|$command" )) {
-			$self->setError (7722071,
-					"OpenCA::OpenSSL->dataConvert: Cannot open pipe to OpenSSL.");
-			unlink ($infile) if ($data);
-			delete($ENV{'pwd'});
-			delete($ENV{'pempwd'});
-			delete($ENV{'inpwd'});
-			delete($ENV{'outpwd'});
-			return undef;
-		}
-		print FD "$data";
-		close( FD );
+                $self->_debug ("dataConvert: data piping is no longer supported - please use tmp files");
+		$self->setError (7722071,
+		    $self->{gettext} ("OpenCA::OpenSSL->dataConvert: Data piping is no longer supported."));
+		return undef;
 	}
-	print "OpenCA::OpenSSL->dataConvert: openssl itself successful<br>\n" if ($self->{DEBUG});
+        $self->_debug ("dataConvert: openssl itself successful");
 
 	delete($ENV{'pwd'});
 	delete($ENV{'pempwd'});
 	delete($ENV{'inpwd'});
 	delete($ENV{'outpwd'});
-	print "OpenCA::OpenSSL->dataConvert: passphrases deleted<br>\n" if ($self->{DEBUG});
+        $self->_debug ("dataConvert: passphrases deleted");
 
-	if( $? != 0 ) {
-		if ( ($? == 256) and ($outform =~ /TXT/i) ) {
-			$? = 0;
-		} else {
-			$self->setError (7722073, "OpenCA::OpenSSL->dataConvert: OpenSSL failed (".$?.").");
-			unlink ($tmpfile) if (not $keys->{OUTFILE});
-			unlink ($infile) if ($data);
-			return undef;
-		}
+	if( not $ret ) {
+		$self->setError (7722073,
+                    $self->{gettext} ("OpenCA::OpenSSL->dataConvert: OpenSSL failed (__ERRNO__). __ERRVAL__",
+                                      "__ERRNO__", $self->errno,
+                                      "__ERRVAL__", $self->errval));
+		unlink ($tmpfile) if (not $keys->{OUTFILE});
+		unlink ($infile) if ($data);
+		return undef;
 	}
 
 	unlink ($infile) if ($data);
 
-	if( $? != 0 ) {
-		$self->setError (7722075, "OpenCA::OpenSSL->dataConvert: OpenSSL failed (".$?.").");
-		unlink ($tmpfile) if (not $keys->{OUTFILE});
-		return undef;
-	}
-
 	if( $keys->{OUTFILE} ) {
-		print "OpenCA::OpenSSL->dataConvert: return 1 and infile deleted if temporary<br>\n" if ($self->{DEBUG});
+                $self->_debug ("dataConvert: return 1 and infile deleted if temporary");
 		return 1;
 	}
 
 	$ret = "";
 	if (not open( TMP, "<$outfile" )) {
-		print "OpenCA::OpenSSL->dataConvert: cannot read outfile $outfile<br>\n" if ($self->{DEBUG});
-		$self->setError (7722081, "OpenCA::OpenSSL->dataConvert: Cannot open outfile $outfile for reading.");
+                $self->_debug ("dataConvert: cannot open outfile $outfile for reading");
+		$self->setError (7722081,
+                    $self->{gettext} ("OpenCA::OpenSSL->dataConvert: Cannot open outfile __FILENAME__ for reading.",
+                                      "__FILENAME__", $outfile));
 		return undef;
 	}
 	while( $tmp = <TMP> ) {
@@ -931,8 +1149,8 @@ sub dataConvert {
 	close( TMP );
 	unlink ($outfile);
 
-	print "OpenCA::OpenSSL->dataConvert: return result like follows<br>\n" if ($self->{DEBUG});
-	print "$ret<br>\n" if ($self->{DEBUG});
+        $self->_debug ("dataConvert: return result like follows");
+        $self->_debug ("dataConvert: $ret");
 	return $ret;
 		
 }
@@ -977,13 +1195,11 @@ sub issueCert {
 	my $outdir   =$keys->{OUTDIR};
 	my $caName   = $keys->{CA_NAME};
 	
-	## my $engine;
-	## $engine     = ( $ENV{'engine'} or $keys->{ENGINE} ) if ($keys->{USE_ENGINE});
-	my $engine     = ( $ENV{'engine'} or $keys->{ENGINE} );
+	my $engine   = $self->{ENGINE};
 
 	my ( $ret, $tmpfile );
 
-	## fix openssl's DN-handling
+	## fix DN-handling of OpenSSL
 	if ($subject) {
 
 		## OpenSSL includes a bug in -nameopt RFC2253
@@ -1004,24 +1220,28 @@ sub issueCert {
 				} else {
 					$now = "value";
 				}
-			} elsif (substr ($subject, $i, 1) =~ /,/) {
+			} elsif (substr ($subject, $i, 1) =~ /[,+]/) {
 				$now = "name";
 			}
 			$i++;
 		}
 
-		print "OpenCA::OpenSSL->issueCert: subject_rfc2253: $subject<br>\n"
-			if ($self->{DEBUG});
+		$subject =~ s/\w+=\s*\,//g;
+		$subject =~ s/\w+=\s*$//;
+		# $self->setError(7712014,"NEW SUBJECT => $subject");
+		# return undef;
+
+                $self->_debug ("issueCert: subject_rfc2253: $subject");
 		my $dn_obj = X500::DN->ParseRFC2253 ($subject);
+                $self->_debug ("issueCert: subject parsed by X500::DN");
 		if (not $dn_obj) {
-			print "OpenCA::OpenSSL->issueCert: cannot create X500::DN-object<br>\n"
-				if ($self->{DEBUG});
-			$self->setError (7731001, "OpenCA::OpenSSL->issueCert: Cannot create X500::DN-object.");
+                        $self->_debug ("issueCert: cannot create X500::DN-object");
+			$self->setError (7731001,
+                            $self->{gettext} ("OpenCA::OpenSSL->issueCert: Cannot create X500::DN-object."));
 			return undef;
 		}
 		$subject = $dn_obj->getOpenSSLString ();
-		print "OpenCA::OpenSSL->issueCert: subject_x500: $subject<br>\n"
-			if ($self->{DEBUG});
+                $self->_debug ("issueCert: subject_x500: $subject");
 	}
 
 	#return if( (not $reqdata) and (not $reqfile));
@@ -1029,21 +1249,20 @@ sub issueCert {
 	# what directory to put it.
 	if( (not $reqdata) and (not $reqfile) and
 	    ((not $reqfiles) or (not $outdir)) ) {
-		$self->setError (7731011, "OpenCA::OpenSSL->issueCert: No request specified.");
+		$self->setError (7731011,
+                    $self->{gettext} ("OpenCA::OpenSSL->issueCert: No request specified."));
 		return undef;
 	}
 	if (not $reqfile and not $reqfiles) {
 		$reqfile = $self->{tmpDir} . "/${$}_req.tmp";
-		if ($self->{DEBUG}) {
-			print "OpenCA::OpenSSL->issueCert: create temporary reqfile $reqfile<br>\n";
-			print "OpenCA::OpenSSL->issueCert: the data is like follows<br>\n";
-			print "$reqdata<br>\n";
-		}
+                $self->_debug ("issueCert: create temporary reqfile $reqfile");
+                $self->_debug ("issueCert: the data is like follows");
+                $self->_debug ("issueCert: $reqdata");
 		if (not  open FD, ">".$reqfile) {
-			print "OpenCA::OpenSSL->issueCertConvert: failed to open temporary reqfile $reqfile<br<\n"
-				if ($self->{DEBUG});
+                        $self->_debug ("issueCertConvert: failed to open temporary reqfile $reqfile");
 			$self->setError (7731015,
-					"OpenCA::OpenSSL->issueCert: Cannot write inputdata to tmpfile $reqfile.");
+			    $self->{gettext} ("OpenCA::OpenSSL->issueCert: Cannot write inputdata to tmpfile __FILENAME__.",
+                                              "__FILENAME__", $reqfile));
 			return undef;
 		}
 		print FD $reqdata;
@@ -1054,15 +1273,20 @@ sub issueCert {
 
 	$inform   = "PEM" if( not $inform ); 
 
-	my $command = "$self->{shell} ca -batch ";
+	my $command = "ca -batch ";
+	## activate this if you have a patched OpenSSL 0.9.8
+	## $command .= "-multivalue-rdn ";
 
         if( $engine ) {
-                $command .= "-engine $engine ";
+                $command .= "-engine $engine -keyform ".$self->{KEYFORM}." ";
         }
 
 	$command .= "-config " .$self->{cnf}." " if ( $self->{cnf} );
 	$command .= "-keyfile $cakey " if( $cakey );
-	$command .= "-passin env:pwd " if ( $passwd ne "" );
+	if (not $self->{PIN_CALLBACK} and not $self->{GET_PIN_CALLBACK})
+	{
+		$command .= "-passin env:pwd " if ( $passwd ne "" );
+	}
 	$command .= "-days $days " if ( $days );
 	$command .= "-extfile $extFile " if ( $extFile );
 	$command .= "-extensions $exts " if ( $exts );
@@ -1070,7 +1294,8 @@ sub issueCert {
 	$command .= "-startdate $startDate " if ( $startDate );
 	$command .= "-enddate $endDate " if ( $endDate );
 	$command .= "-name $caName " if ( $caName );
-	$command .= "-subj \Q$subject\E " if ( $subject );
+	$command .= "-subj \"$subject\" " if ( $subject );
+        $command .= "-multivalue-rdn " if ($subject and $subject =~ /[^\\](\\\\)*\+/);
 	$command .= "-noemailDN " if ( $keys->{NOEMAILDN} );
 	$command .= "-nouniqueDN " if ( $keys->{NOUNIQUEDN} );
 
@@ -1084,37 +1309,33 @@ sub issueCert {
 	} elsif ( $inform =~ /SPKAC/ ) {
 		if ( not $reqfile ) {
 			$self->setError (7731012,
-					"OpenCA::OpenSSL->issueCert: You must specify a requestfile if you use SPKAC.");
+			    $self->{gettext} ("OpenCA::OpenSSL->issueCert: You must specify a requestfile if you use SPKAC."));
 			return undef;
 		}
 		$command .= "-spkac $reqfile ";
 	} else {
 		## no valid format received ...
 		$self->setError (7731013,
-				"OpenCA::OpenSSL->issueCert: The requests format ($inform) is not supported.");
+		    $self->{gettext} ("OpenCA::OpenSSL->issueCert: The requests format (__FORMAT__) is not supported.",
+                                      "__FORMAT__", $inform));
 		return undef;
 	}
 
 	## running the OpenSSL command
-	print "OpenCA::OpenSSL->issueCert: openssl=\Q$command\E<br>\n"
-		if ($self->{DEBUG});
+        $self->_debug ("issueCert: openssl=$command");
 	$ENV{'pwd'} = "$passwd";
-	if (not open( FD, "$command 2>&1|" )) {
-		$self->setError (7731073, "OpenCA::OpenSSL->issueCert: Cannot open pipe to OpenSSL.");
-		delete ($ENV{'pwd'});
-		return undef;
-	}
-	$ret = join ('', <FD>);
-	close(FD);
+        $ret = $self->_execute_command (COMMAND => $command, KEY_USAGE => $engine);
 	delete ($ENV{'pwd'});
 	unlink ($reqfile) if ($reqdata);
-	if( $? != 0) {
-		$self->setError (7731075, "OpenCA::OpenSSL->issueCert: OpenSSL fails (".$?.": ".$ret.").");
+	if( not $ret ) {
+		$self->setError (7731075,
+                    $self->{gettext} ("OpenCA::OpenSSL->issueCert: OpenSSL fails (__ERRNO__). __ERRVAL__",
+                                      "__ERRNO__", $self->errno,
+                                      "__ERRVAL__", $self->errval));
 		return undef;
 	}
 
-	print "OpenCA::OpenSSL->issueCert: certificate issued successfully<br>\n"
-		if ($self->{DEBUG});
+        $self->_debug ("issueCert: certificate issued successfully");
 	return 1;
 }
 
@@ -1143,48 +1364,45 @@ sub revoke {
 	my $cakey    = $keys->{CAKEY};
 	$cakey = $self->{KEY} if (not $cakey);
 	my $cacert   = $keys->{CACERT};
-	$cacert = $self->{CERT} if (not $cacert);
+	$cacert = $self->{PEM_CERT} if (not $cacert);
 	my $passwd   = $keys->{PASSWD};
 	$passwd = $self->{PASSWD} if (not $passwd);
 	my $certFile = $keys->{INFILE};
 	my $crlReason= $keys->{CRL_REASON};
 
-	## my $engine;
-	## $engine     = ( $ENV{'engine'} or $keys->{ENGINE} ) if ($keys->{USE_ENGINE});
-	my $engine     = ( $ENV{'engine'} or $keys->{ENGINE} );
+	my $engine = $self->{ENGINE};
 
 	my ( $tmp, $ret );
-	my $command = "$self->{shell} ca -revoke \Q$certFile\E ";
+	my $command = "ca -revoke $certFile ";
 
 	if (not $certFile) {
-		$self->setError (7732011, "OpenCA::OpenSSL->revoke: No inputfile specified.");
+		$self->setError (7732011,
+                    $self->{gettext} ("OpenCA::OpenSSL->revoke: No inputfile specified."));
 		return undef;
 	}
 
         if( $engine ) {
-                $command .= "-engine $engine ";
+                $command .= "-engine $engine -keyform ".$self->{KEYFORM}." ";
         }
 
 	$command .= "-config " . $self->{cnf}. " " if ( defined($self->{'cnf'}) && $self->{cnf} ne "" );
 	$command .= "-keyfile $cakey " if( defined($cakey) && $cakey ne "" );
-	$command .= "-passin env:pwd " if ( defined($passwd) && $passwd ne "" );
+	if (not $self->{PIN_CALLBACK} and not $self->{GET_PIN_CALLBACK})
+	{
+		$command .= "-passin env:pwd " if ( defined($passwd) && $passwd ne "" );
+	}
 	$command .= "-cert $cacert " if ( defined($cacert) && $cacert ne "" );
 	$command .= "-nouniqueDN " if ( $keys->{NOUNIQUEDN} );
 	$command .= "-crl_reason $crlReason " if ( $keys->{CRL_REASON} );
 
 	$ENV{'pwd'} = "$passwd";
-	if (not open( FD, "$command 2>&1|" )) {
-		$self->setError (7732071, "OpenCA::OpenSSL->revoke: Cannot open pipe to OpenSSL.");
-		delete ($ENV{'pwd'});
-		return undef;
-	}
-	while( $tmp = <FD> ) {
-		$ret .= $tmp;
-	}
-	close(FD);
+        $ret = $self->_execute_command (COMMAND => $command, KEY_USAGE => $engine);
 	delete ($ENV{'pwd'});
-	if( $? != 0) {
-		$self->setError (7732073, "OpenCA::OpenSSL->revoke: OpenSSL failed (".$?.": ".$ret.").");
+	if( not $ret ) {
+		$self->setError (7732073,
+                    $self->{gettext} ("OpenCA::OpenSSL->revoke: OpenSSL failed (__ERRNO__). __ERRVAL__" . "<br /><br />(COMMAND=>$command)",
+                                      "__ERRNO__", $self->errno,
+                                      "__ERRVAL__", $self->errval));
 		return undef;
 	} else {
 		return 1;
@@ -1198,6 +1416,7 @@ sub issueCrl {
 	## CACERT  => $CAcertfile
 	## PASSWD  => $passwd
 	## DAYS    => $days
+	## SECONDS => $seconds
 	## EXTS    => $extentions
 	## OUTFILE => $outfile
 	## OUTFORM => PEM|DER|NET|TXT
@@ -1208,8 +1427,9 @@ sub issueCrl {
 	my $cakey    = $keys->{CAKEY};
 	$cakey = $self->{KEY} if (not $cakey);
 	my $cacert   = $keys->{CACERT};
-	$cacert = $self->{CERT} if (not $cacert);
-	my $days     = $keys->{DAYS};
+	$cacert = $self->{PEM_CERT} if (not $cacert);
+	my $hours     = $keys->{HOURS};
+	my $days      = $keys->{DAYS};
 	my $passwd   = $keys->{PASSWD};
 	$passwd = $self->{PASSWD} if (not $passwd);
 	my $outfile  = $keys->{OUTFILE};
@@ -1217,15 +1437,13 @@ sub issueCrl {
 	my $exts     = $keys->{EXTS};
 	my $extfile  = $keys->{EXTFILE};
 
-	## my $engine;
-	## $engine     = ( $ENV{'engine'} or $keys->{ENGINE} ) if ($keys->{USE_ENGINE});
-	my $engine     = ( $ENV{'engine'} or $keys->{ENGINE} );
+	my $engine   = $self->{ENGINE};
 	
 	my ( $ret, $tmp, $tmpfile );
-	my $command = "$self->{shell} ca -gencrl ";
+	my $command = "ca -gencrl ";
 
         if( $engine ) {
-                $command .= "-engine $engine ";
+                $command .= "-engine $engine -keyform ".$self->{KEYFORM}." ";
         }
 
 	if ( not defined $outfile or $outfile eq "" ){
@@ -1237,19 +1455,26 @@ sub issueCrl {
 
 	$command .= "-config " . $self->{cnf}. " " if ( defined($self->{'cnf'}) && $self->{cnf} ne "" );
 	$command .= "-keyfile $cakey " if( defined($cakey) && $cakey ne "" );
-	$command .= "-passin env:pwd " if ( defined($passwd) && $passwd ne "" );
+	if (not $self->{PIN_CALLBACK} and not $self->{GET_PIN_CALLBACK})
+	{
+		$command .= "-passin env:pwd " if ( defined($passwd) && $passwd ne "" );
+	}
 	$command .= "-cert $cacert " if ( defined($cacert) && $cacert ne "" );
 	$command .= "-crldays $days " if ( defined($days) && $days ne "" );
+	$command .= "-crlhours $hours " if ( defined($hours) && $hours ne "" );
 	$command .= "-crlexts $exts " if ( defined($exts) && $exts ne "" );
 	$command .= "-extfile $extfile " if ( defined($extfile) && $extfile ne "" );
 	$command .= "-nouniqueDN " if ( $keys->{NOUNIQUEDN} );
 
 	$ENV{'pwd'} = "$passwd";
-	$ret = `$command`;
+	$ret = $self->_execute_command (COMMAND => $command, KEY_USAGE => $engine);
 	delete( $ENV{'pwd'} );
 
-	if( $? != 0) {
-		$self->setError (7733071, "OpenCA::OpenSSL->issueCrl: OpenSSL failed (".$?.").");
+	if( not $ret ) {
+		$self->setError (7733071,
+                    $self->{gettext} ("OpenCA::OpenSSL->issueCrl: OpenSSL failed (__ERRNO__). __ERRVAL__",
+                                      "__ERRNO__", $self->errno,
+                                      "__ERRVAL__", $self->errval));
 		return undef;
 	}
 
@@ -1258,14 +1483,18 @@ sub issueCrl {
 				   DATATYPE=>"CRL" );
 
 	if( not $ret ) {
-		## the error occurs in dataConvert so we don't change the errorcode itself
-		$self->{errval} = "OpenCA::OpenSSL->issueCrl: Errorcode 7733082:\n".$self->{errval};
+		$self->setError (7733082,
+                    $self->{gettext} ("OpenCA::OpenSSL->issueCrl: data conversion failed (__ERRNO__). __ERRVAL__",
+                                      "__ERRNO__", $self->errno(),
+                                       "__ERRVAL__", $self->errval()));
 		return undef;
 	}
 
 	if( defined($outfile) && $outfile ne "" ) {
 		if (not open( FD, ">$outfile" )) {
-			$self->setError (7733084, "OpenCA::OpenSSL->issueCrl: Cannot open outfile $outfile for writing.");
+			$self->setError (7733084,
+                            $self->{gettext} ("OpenCA::OpenSSL->issueCrl: Cannot open outfile __FILENAME__ for writing.",
+                                              "__FILENAME__", $outfile));
 			return undef;
 		}
 		print FD "$ret";
@@ -1286,12 +1515,10 @@ sub SPKAC {
 	my $outfile = $keys->{OUTFILE};
 	my $spkac   = $keys->{SPKAC};
 
-	my $command = $self->{shell} . " spkac -verify ";
+	my $command = "spkac -verify ";
 	my $tmpfile = $self->{tmpDir} . "/${$}_SPKAC.tmp";
 
-	## my $engine;
-	## $engine     = ( $ENV{'engine'} or $keys->{ENGINE} ) if ($keys->{USE_ENGINE});
-	my $engine     = ( $ENV{'engine'} or $keys->{ENGINE} );
+	my $engine  = $self->{ENGINE};
 
 	my $ret = "";
 	my $retVal = 0;
@@ -1300,7 +1527,9 @@ sub SPKAC {
 	if( defined($spkac) && $spkac ne "" ) {
 		$infile = $self->{tmpDir} . "/${$}_in_SPKAC.tmp";
 		if (not open( FD, ">$infile" )) {;
-			$self->setError (7741011, "OpenCA::OpenSSL->SPKAC: Cannot open infile $infile for writing.");
+			$self->setError (7741011,
+                            $self->{gettext} ("OpenCA::OpenSSL->SPKAC: Cannot open infile __FILENAME__ for writing.",
+                                              "__FILENAME__", $infile));
 			return undef;
 		}
 		print FD "$spkac\n";
@@ -1318,20 +1547,16 @@ sub SPKAC {
 		$command .= "-out $tmpfile ";
 	}
 
-	if (not open( FD, "|$command" )) {
-		$self->setError (7741071, "OpenCA::OpenSSL->SPKAC: Cannot open pipe to OpenSSL.");
-		return undef;
-	}
-	close( FD );
-
-	## Store the ret value
-	$retVal = $?;
+        $ret = $self->_execute_command (COMMAND => $command);
 
 	## Unlink the infile if it was temporary
 	unlink $infile if( defined($spkac) && $spkac ne "");
 
-	if ($retVal != 0) {
-		$self->setError (7741073, "OpenCA::OpenSSL->SPKAC: OpenSSL failed (".$retVal.").");
+	if (not $ret) {
+		$self->setError (7741073,
+                    $self->{gettext} ("OpenCA::OpenSSL->SPKAC: OpenSSL failed (__ERRNO__). __ERRVAL__",
+                                      "__ERRNO__", $self->errno,
+                                      "__ERRVAL__", $self->errval));
 		return undef;
 	}
 
@@ -1341,7 +1566,9 @@ sub SPKAC {
 
 	## Get the output
 	if (not open( TMP, "$tmpfile" )) {
-		$self->setError (7741081, "OpenCA::OpenSSL->SPKAC: Cannot open tmpfile $tmpfile.");
+		$self->setError (7741081,
+                    $self->{gettext} ("OpenCA::OpenSSL->SPKAC: Cannot open tmpfile __FILENAME__.",
+                                      "__FILENAME__", $tmpfile));
 		return undef;
 	}
 	while ( $tmp = <TMP> ) {
@@ -1351,12 +1578,41 @@ sub SPKAC {
 	unlink $tmpfile if (not defined $outfile or $outfile eq "");
 
 	if ( $? != 0 ) {
-		$self->setError (7741083, "OpenCA::OpenSSL->SPKAC: Cannot read tmpfile $tmpfile successfully (".$?.").");
+		$self->setError (7741083,
+                    $self->{gettext} ("OpenCA::OpenSSL->SPKAC: Cannot read tmpfile __FILENAME__ successfully (__ERRNO__).",
+                                      "__FILENAME__", $tmpfile,
+                                      "__ERRNO__", $?));
 		return undef;
 	}
 
 	return $ret;
 }
+
+sub getFingerprint {
+	my $self = shift;
+
+	my $keys = { @_ };
+
+	my $alg = lc ( $keys->{ALGORITHM} );
+	my $cert = $keys->{CERT};
+
+	if ( $alg eq "" ) {
+		$alg = "sha1";
+	}
+
+	if ( not $cert or not $cert->getPEM()) {
+		return undef;
+	}
+
+	my $cert_dat =  OpenCA::OpenSSL::X509::_new_from_pem ($cert->getPEM());
+
+	return OpenCA::OpenSSL::X509::fingerprint ( $cert_dat, $alg );
+
+	# return getDigest ( 	DATA      => $keys->{DATA},
+	#			ALGORITHM => $alg,
+	#			ENGINE    => $keys->{ENGINE} );
+}
+
 
 sub getDigest {
 
@@ -1368,48 +1624,45 @@ sub getDigest {
 	
 	my $data    = $keys->{DATA};
 	my $alg     = lc( $keys->{ALGORITHM} );
-	my $tmpfile = $self->{tmpDir} . "/${$}_dgst.tmp";
 
-	## my $engine;
-	## $engine     = ( $ENV{'engine'} or $keys->{ENGINE} ) if ($keys->{USE_ENGINE});
-	my $engine     = ( $ENV{'engine'} or $keys->{ENGINE} );
+	my $engine  = $self->{ENGINE};
 
 	my ( $command, $ret );
 
-	$alg = "md5" if( not $alg );
+	$alg = "sha256" if( not $alg );
 
 	if (not $data) {
-		$self->setError (7751011, "OpenCA::OpenSSL->getDigest: No data specified.");
+		$self->setError (7751011,
+                    $self->{gettext} ("OpenCA::OpenSSL->getDigest: No data specified."));
 		return undef;
 	}
-	if (not open( FD, ">$tmpfile" )) {
-		$self->setError (7751031, "OpenCA::OpenSSL->getDigest: Cannot open tmpfile $tmpfile for writing.");
-		return undef;
-	}
-	print FD $data;
-	close( FD );
 
-	$command = "$self->{shell} dgst -$alg ";
+	$command = "dgst -$alg ";
 
         if( defined($engine) and ($engine ne "")) {
                 $command .= "-engine $engine ";
         }
 
-	$command .= "<\Q$tmpfile\E";
-
-	$ret = `$command`;
+	$ret = $self->_execute_command (COMMAND => $command, INPUT => $data);
 	$ret =~ s/\n//g;
+	$ret =~ s/^[^=]+=\s+//;
 
-	unlink( $tmpfile );
-
-	if( $? != 0 ) {
-		$self->setError (7751071, "OpenCA::OpenSSL->getDigest: OpenSSL failed (".$?.").");
+	if( not $ret ) {
+		$self->setError (7751071,
+                    $self->{gettext} ("OpenCA::OpenSSL->getDigest: OpenSSL failed (__ERRNO__). __ERRVAL__",
+                                      "__ERRNO__", $self->errno,
+                                      "__ERRVAL__", $self->errval));
 		return undef;
 	} else {
 		return $ret;
 	}
 }
 
+# The common invocation mode requires a DATA specification (signed text)
+# and a SIGNATURE (detached PKCS#7 signature).
+# If OPAQUESIGNATURE is set, DATA and DATA_FILE must not be specified,
+# and SIGNATURE or SIGNATURE_FILE must hold a PKCS#7 object containing 
+# both data and signature.
 sub verify {
 
 	## Verify PKCS7 signatures (new OpenCA::verify command
@@ -1423,46 +1676,30 @@ sub verify {
 	my $sig     = $keys->{SIGNATURE};
 	my $sigfile = $keys->{SIGNATURE_FILE};
 	my $cacert  = $keys->{CA_CERT};
-	$cacert = $self->{CERT} if (not $cacert);
+	$cacert = $self->{PEM_CERT} if (not $cacert);
 	my $cadir   = $keys->{CA_DIR};
 	my $verbose = $keys->{VERBOSE};
 	my $out	    = $keys->{OUTFILE};
 	my $noChain = $keys->{NOCHAIN};
+	my $opaquesig = $keys->{OPAQUESIGNATURE};
 	my $tmpfile = $self->{tmpDir} . "/${$}_vrfy.tmp";
 	my $command = $self->{verify} . " ";
 
 	my ( $ret, $tmp );
 
-	if( (not $data) and (not $datafile) ) {
-		print "OpenCA::OpenSSL->verify: cannot open command<br>\n"
-			if ($self->{DEBUG});
-		$self->setError (7742011, "OpenCA::OpenSSL->verify: No input source specified.");
+	if((not $opaquesig) and (not $data) and (not $datafile) ) {
+                $self->_debug ("verify: cannot open command");
+		$self->setError (7742011,
+                    $self->{gettext} ("OpenCA::OpenSSL->verify: No input source specified."));
 		return undef;
 	}
 
-## IE's signatures are not a problem for openca-verify
-##	## load datafile to fix signature
-##	if ($datafile) {
-##		if (not open( TMP, "<$datafile" )) {
-##			print "OpenCA::OpenSSL->verify: cannot open datafile to fix crlf<br>\n"
-##				if ($self->{DEBUG});
-##			$self->setError (7742021, "OpenCA::OpenSSL->verify: Cannot open datafile $datafile for reading.");
-##			return undef;
-##		}
-##		$data = "";
-##		while( not eof ( TMP ) ) {
-##			$data .= <TMP>;
-##		}
-##		close( TMP );
-##	}
-##
-##	## fix signatures of IE
-##	## $data =~ s/\r//g;
-
-	if (not $datafile) {
+	if ((not $opaquesig) and (not $datafile)) {
 		$datafile = $self->{tmpDir} . "/${$}_data.tmp";
 		if (not open (FD, ">".$datafile)) {
-			$self->setError (7742023, "OpenCA::OpenSSL->verify: Cannot open datafile $datafile for writing.");
+			$self->setError (7742023,
+                            $self->{gettext} ("OpenCA::OpenSSL->verify: Cannot open datafile __FILENAME__ for writing.",
+                                              "__FILENAME__", $datafile));
 			return undef;
 		}
 		print FD $data;
@@ -1474,7 +1711,9 @@ sub verify {
 	if (not $sigfile) {
 		$sigfile = $self->{tmpDir} . "/${$}_sig.tmp";
 		if (not open (FD, ">".$sigfile)) {
-			$self->setError (7742025, "OpenCA::OpenSSL->verify: Cannot open sigfile $sigfile for writing.");
+			$self->setError (7742025,
+                            $self->{gettext} ("OpenCA::OpenSSL->verify: Cannot open sigfile __FILENAME__ for writing.",
+                                              "__FILENAME__", $sigfile));
 			unlink $datafile if ($data);
 			return undef;
 		}
@@ -1489,20 +1728,19 @@ sub verify {
 	$command   .= "-cf $cacert " if ( $cacert );
 	$command   .= "-cd $cadir " if ($cadir);
 	$command   .= "-data $datafile " if ($datafile);
-	## the user should know what he's doing
+	## the user should know what he is doing
 	## $command   .= "-no_chain " if ( $noChain and not($cacert or $cadir));
 	$command   .= "-no_chain " if ( $noChain );
 	$command   .= "-in $sigfile" if ( $sigfile );
-	$command   .= ">\Q$out\E " if ( $out );
+	$command   .= ">$out " if ( $out );
 
 	if( not $out ) {
-		$command .= " >\Q$tmpfile\E";
+		$command .= " >$tmpfile";
 	}
 
 	$command .= " 2>\&1";
 
-	print "OpenCA::OpenSSL->verify: command=\Q$command\E<br>\n"
-		if ($self->{DEBUG});
+        $self->_debug ("verify: command=$command");
 
 	$ret =`$command`;
 	my $org_err = $?;
@@ -1512,9 +1750,10 @@ sub verify {
 
 	$ret = "";
 	if (not open( TMP, "<$tmpfile" )) {
-		print "OpenCA::OpenSSL->verify: Cannot open tmpfile<br>\n"
-			if ($self->{DEBUG});
-		$self->setError (7742082, "OpenCA::OpenSSL->verify: Cannot open tmpfile $tmpfile for reading.");
+                $self->_debug ("verify: Cannot open tmpfile");
+		$self->setError (7742082,
+                    $self->{gettext} ("OpenCA::OpenSSL->verify: Cannot open tmpfile __FILENAME__ for reading.",
+                                      "__FILENAME__", $tmpfile));
 		return undef;
 	}
 	while( not eof ( TMP ) ) {
@@ -1523,38 +1762,59 @@ sub verify {
 	close( TMP );
 
 	if ( $? == 256 ) {
-		if ($self->{DEBUG}) {
-			print "OpenCA::OpenSSL->verify: error detected<br>\n";
-			print "OpenCA::OpenSSL->verify: original errorcode: ".$?."<br>\n";
-			print "OpenCA::OpenSSL->verify: deleting error<br>\n";
-		}
+                $self->_debug ("verify: error detected");
+                $self->_debug ("verify: original errorcode: ${?}");
+                $self->_debug ("verify: deleting error");
 		$? = 0;
 	} elsif ( $? != 0 ) {
-		if ($self->{DEBUG}) {
-			print "OpenCA::OpenSSL->verify: error detected<br>\n";
-			print "OpenCA::OpenSSL->verify: original errorcode: ".$?."<br>\n";
-		}
+            if ($? == -1)
+            {
+	        $self->setError (7742071,
+                    $self->{gettext} ("OpenCA::OpenSSL->verify: openca-sv failed with errorcode -1. This usually means that the command __COMMAND__ is not present.",
+                                      "__COMMAND__", $self->{verify}));
+            } elsif ($? == 32256)
+            {
+	        $self->setError (7742074,
+                    $self->{gettext} ("OpenCA::OpenSSL->verify: openca-sv failed with errorcode 32256. This usually means that the file permissions are wrong for the command __COMMAND__.",
+                                      "__COMMAND__", $self->{verify}));
+            } elsif ($? == 32512)
+            {
+	        $self->setError (7742072,
+                    $self->{gettext} ("OpenCA::OpenSSL->verify: openca-sv failed with errorcode 32512. This usually means that the command openca-sv is malformed or not present (__COMMAND__).",
+                                      "__COMMAND__", $self->{verify}));
+            } else
+            {
+                $self->_debug ("verify: error detected");
+                $self->_debug ("verify: original errorcode: ${?}");
 		(my $h) = 
 			( $ret =~ /(Verify Error\s*.*?\s*:\s*.*?)\n/ );
-		$self->setError (7742073, "OpenCA::OpenSSL->verify: openca-verify failed (".$org_err."):\n".$h);
-		if ($self->{DEBUG}) {
-			print "OpenCA::OpenSSL->verify: errorcode: ".$self->errno()."<br>\n";
-			print "OpenCA::OpenSSL->verify: errormsg: ".$self->errval()."<br>\n";
-		}
-		unlink( $tmpfile ) if (not $out);
+		$self->setError (7742073,
+                    $self->{gettext} ("OpenCA::OpenSSL->verify: openca-sv failed (__ERRNO__). __ERRVAL__",
+                                      "__ERRNO__", $org_err,
+                                      "__ERRVAL__", $h));
+                $self->_debug ("verify: errorcode: $self->errno");
+                $self->_debug ("verify: errormsg: $self->errval");
+            }
+	    unlink( $tmpfile ) if (not $out);
+	    return undef;
+	}
+	unlink( $tmpfile ) if (not $out);
+	if ($ret =~ /\[Error\]/i)
+	{
+		$self->setError (7742075,
+                    $self->{gettext} ("OpenCA::OpenSSL->verify: openca-sv failed. __ERRVAL__",
+                                      "__ERRVAL__", $ret));
 		return undef;
 	}
+            
 
-	print "OpenCA::OpenSSL->verify: returned data:\n<br>".$ret."<br>\n"
-		if ($self->{DEBUG});
+        $self->_debug ("verify: returned data:\n$ret");
 	if( not $out) {
 		unlink( $tmpfile );
-		print "OpenCA::OpenSSL->verify: finished successfully (return output)<br>\n"
-			if ($self->{DEBUG});
+                $self->_debug ("verify: finished successfully (return output)");
 		return $ret;
 	} else {
-		print "OpenCA::OpenSSL->verify: finished successfully (return 1)<br>\n"
-			if ($self->{DEBUG});
+                $self->_debug ("verify: finished successfully (return 1)");
 		return 1;
 	}
 }
@@ -1570,7 +1830,7 @@ sub sign {
 	my $datafile= $keys->{DATA_FILE};
 	my $out     = $keys->{OUT_FILE};
 	my $certfile= $keys->{CERT_FILE};
-	$certfile = $self->{CERT} if (not $certfile);
+	$certfile = $self->{PEM_CERT} if (not $certfile);
 	my $cert    = $keys->{CERT};
 	my $keyfile = $keys->{KEY_FILE};
 	$keyfile = $self->{KEY} if (not $keyfile);
@@ -1579,27 +1839,37 @@ sub sign {
 	my $pwd     = ( $keys->{PWD} or $keys->{PASSWD} );
 	$pwd = $self->{PASSWD} if (not $pwd);
 	my $tmpfile = $self->{tmpDir} . "/${$}_sign.tmp";
+
 	my $command = $self->{sign} . " ";
+        if( $self->{ENGINE} ) {
+                my $init = $self->_build_engine_params(KEY_USAGE => "1");
+                $command .= " -engine $self->{ENGINE} -keyform ".$self->{KEYFORM}." $init ";
+        }
 
 	my ( $ret );
 
 	if( (not $data) and (not $datafile) ) {
-		$self->setError (7743011, "OpenCA::OpenSSL->sign: No input source.");
+		$self->setError (7743011,
+                    $self->{gettext} ("OpenCA::OpenSSL->sign: No input source."));
 		return undef;
 	}
 	if( (not $cert) and (not $certfile) ) {
-		$self->setError (7743012, "OpenCA::OpenSSL->sign: No certificate specified.");
+		$self->setError (7743012,
+                    $self->{gettext} ("OpenCA::OpenSSL->sign: No certificate specified."));
 		return undef;
 	}
 	if( (not $key)  and (not $keyfile) ) {
-		$self->setError (7743012, "OpenCA::OpenSSL->sign: No private key specified.");
+		$self->setError (7743013,
+                    $self->{gettext} ("OpenCA::OpenSSL->sign: No private key specified."));
 		return undef;
 	}
 
 	if ( not $datafile ) {
 		$datafile = $self->{tmpDir} . "/${$}_data.tmp";
 		if (not open FD, ">".$datafile) {
-			$self->setError (7743031, "OpenCA::OpenSSL->sign: Cannot open datafile $datafile for writing.");
+			$self->setError (7743031,
+                            $self->{gettext} ("OpenCA::OpenSSL->sign: Cannot open datafile __FILENAME__ for writing.",
+                                              "__FILENAME__", $datafile));
 			return undef;
 		}
 		print FD $data;
@@ -1610,7 +1880,9 @@ sub sign {
 	if ( not $keyfile ) {
 		$keyfile = $self->{tmpDir} . "/${$}_key.tmp";
 		if (not open FD, ">".$keyfile) {
-			$self->setError (7743033, "OpenCA::OpenSSL->sign: Cannot open keyfile $keyfile for writing.");
+			$self->setError (7743033,
+                            $self->{gettext} ("OpenCA::OpenSSL->sign: Cannot open keyfile __FILENAME__ for writing.",
+                                              "__FILENAME__", $keyfile));
 			unlink ($datafile) if ($data);
 			return undef;
 		}
@@ -1622,7 +1894,9 @@ sub sign {
 	if ( not $certfile ) {
 		$certfile = $self->{tmpDir} . "/${$}_cert.tmp";
 		if (not open FD, ">".$certfile) {
-			$self->setError (7743035, "OpenCA::OpenSSL->sign: Cannot open certfile $certfile for writing.");
+			$self->setError (7743035,
+                            $self->{gettext} ("OpenCA::OpenSSL->sign: Cannot open certfile __FILENAME__ for writing.",
+                                              "__FILENAME__", $certfile));
 			unlink ($datafile) if ($data);
 			unlink ($keyfile) if ($key);
 			return undef;
@@ -1635,7 +1909,10 @@ sub sign {
 
 	$command   .= "-in $datafile ";
 	$command   .= "-out $out "            if ( $out );
-	$command   .= "-passin env:pwd " if ( $pwd );
+	if (not $self->{GET_PIN_CALLBACK})
+	{
+		$command   .= "-passin env:pwd " if ( $pwd );
+	}
 	$command   .= "-nd "                  if ( $nonDetach );
 
 	$command   .= "-cert $certfile ";
@@ -1645,24 +1922,38 @@ sub sign {
 		$command .= " >$tmpfile";
 	};
 
-        print "OpenCA::OpenSSL: the command is as follows<br>\n".
-	      "$command<br>\n"
-		if ($self->{DEBUG});
+        $self->_debug ("sign: $command");
 
 	$ENV{pwd} = "$pwd" if ( $pwd );
 	$ret =`$command`;
 	delete ($ENV{pwd});
 
 	if ( $? == 256 ) {
-		print "OpenCA::OpenSSL: Error 256 detected<br>\n".
-			"OpenCA::OpenSSL: resetting error<br>\n"
-			if ($self->{DEBUG});
+                $self->_debug ("sign: Error 256 detected");
+                $self->_debug ("sign: ignoring error");
 	} elsif ( $? ) {
 		unlink( $tmpfile )  if (not $out);
 		unlink( $datafile ) if ($data);
 		unlink( $keyfile )  if ($key);
 		unlink( $certfile ) if ($cert);
-		$self->setError (7743071, "OpenCA::OpenSSL->sign: openca-sign failed (".$?.").");
+                if ($? == -1)
+                {
+		    $self->setError (7743073,
+                        $self->{gettext} ("OpenCA::OpenSSL->sign: openca-sv failed with errorcode -1. This usually means that the command __COMMAND__ is not present.",
+                                          "__COMMAND__", $self->{openca_sv}));
+                } elsif ($? == 32256) {
+		    $self->setError (7743074,
+                        $self->{gettext} ("OpenCA::OpenSSL->sign: openca-sv failed with errorcode 32256. This usually means that the file permissions are wrong for the command __COMMAND__.",
+                                          "__COMMAND__", $self->{openca_sv}));
+                } elsif ($? == 32512) {
+		    $self->setError (7743072,
+                        $self->{gettext} ("OpenCA::OpenSSL->sign: openca-sv failed with errorcode 32512. This usually means that the command openca-sv is malformed or not present (__COMMAND__).",
+                                          "__COMMAND__", $self->{openca_sv}));
+                } else {
+		    $self->setError (7743071,
+                        $self->{gettext} ("OpenCA::OpenSSL->sign: openca-sv failed (__ERRNO__).",
+                                          "__ERRNO__", $?));
+                }
 		return undef;
 	}
 	unlink( $datafile ) if ($data);
@@ -1671,7 +1962,9 @@ sub sign {
 
 	if( not $out ) {
 		if (not open( TMP, "<$tmpfile" )) {
-			$self->setError (7743081, "OpenCA::OpenSSL->sign: Cannot open tmpfile $tmpfile for reading.");
+			$self->setError (7743081,
+                            $self->{gettext} ("OpenCA::OpenSSL->sign: Cannot open tmpfile __FILENAME__ for reading.",
+                                              "__FILENAME__", $tmpfile));
 			return undef;
 		}
 		do {
@@ -1683,7 +1976,295 @@ sub sign {
 	}
 
 	## If we are here there have been no errors, so
-	## if $ret is empty, let's return a true value...
+	## if $ret is empty, let us return a true value...
+	$ret = 1 if ( not $ret );
+
+	return $ret;
+}
+
+sub encrypt {
+
+	## Encrypt PKCS7 containers
+
+	my $self = shift;
+	my $keys = { @_ };
+	my $data    = $keys->{DATA};
+	my $datafile= $keys->{DATA_FILE};
+	my $certfile= $keys->{CERT_FILE};
+	$certfile = $self->{PEM_CERT} if (not $certfile);
+	my $out	    = $keys->{OUTFILE};
+	my $tmpfile = $self->{tmpDir} . "/${$}_decrypt.tmp";
+	my $command = $self->{encrypt} . " ";
+
+	my ( $ret, $tmp );
+
+	if( (not $data) and (not $datafile) ) {
+		$self->setError (7747011,
+                    $self->{gettext} ("OpenCA::OpenSSL->encrypt: No input source specified."));
+		return undef;
+	}
+	if( not $certfile ) {
+		$self->setError (7747012,
+                    $self->{gettext} ("OpenCA::OpenSSL->encrypt: No certificate specified."));
+		return undef;
+	}
+
+	if (not $datafile) {
+		$datafile = $self->{tmpDir} . "/${$}_data.tmp";
+		if (not open (FD, ">".$datafile)) {
+			$self->setError (7747023,
+                            $self->{gettext} ("OpenCA::OpenSSL->encrypt: Cannot open datafile __FILENAME__ for writing.",
+                                              "__FILENAME__", $datafile));
+			return undef;
+		}
+		print FD $data;
+		close FD;
+	} else {
+		$data = 0;
+	}
+
+	$command   .= "-in $datafile " if ($datafile);
+	$command   .= "-cert $certfile ";
+	$command   .= ">$out " if ( $out );
+
+	if( not $out ) {
+		$command .= " $tmpfile";
+	}
+
+        $self->_debug ("encrypt: command=$command");
+
+	$ret =`$command`;
+	my $org_err = $?;
+        $self->_debug ("encrypt: question mark: ${?}");
+        $self->_debug ("encrypt: \@: ${@}");
+        $self->_debug ("encrypt: ret: $ret");
+	unlink ($datafile ) if ($data);
+
+	if (not $out)
+	{
+		$ret = "";
+		if (not open( TMP, "<$tmpfile" )) {
+                        $self->_debug ("encrypt: Cannot open tmpfile for reading");
+			$self->setError (7747082,
+                            $self->{gettext} ("OpenCA::OpenSSL->encrypt: Cannot open tmpfile __FILENAME__ for reading.",
+                                              "__FILENAME__", $tmpfile));
+			return undef;
+		}
+		while( not eof ( TMP ) ) {
+			$ret .= <TMP>;
+		}
+		close( TMP );
+	}
+
+	if ( $? == 256 and not $@ )
+        {
+                $self->_debug ("encrypt: error detected");
+                $self->_debug ("encrypt: original errorcode: ${?}");
+                $self->_debug ("encrypt: deleting error");
+		$? = 0;
+        } elsif ($? != 0) 
+        {
+            if ($? == -1)
+            {
+	        $self->setError (7747071,
+                    $self->{gettext} ("OpenCA::OpenSSL->encrypt: openca-sv failed with errorcode -1. This usually means that the command __COMMAND__ is not present.",
+                                      "__COMMAND__", $self->{encrypt}));
+            } elsif ($? == 32256)
+            {
+	        $self->setError (7747074,
+                    $self->{gettext} ("OpenCA::OpenSSL->encrypt: openca-sv failed with errorcode 32256. This usually means that the file permissions are wrong for the command __COMMAND__.",
+                                      "__COMMAND__", $self->{encrypt}));
+            } elsif ($? == 32512)
+            {
+	        $self->setError (7747072,
+                    $self->{gettext} ("OpenCA::OpenSSL->encrypt: openca-sv failed with errorcode 32512. This usually means that the command openca-sv is malformed or not present (__COMMAND__).",
+                                      "__COMMAND__", $self->{encrypt}));
+	    } else
+            {
+                $self->_debug ("encrypt: error detected");
+                $self->_debug ("encrypt: original errorcode: ${?}");
+	        ## (my $h) = 
+	        ## ( $ret =~ /(Encrypt Error\s*.*?\s*:\s*.*?)\n/ );
+	        my $h = $ret;
+
+		$self->setError (7747073,
+                    $self->{gettext} ("OpenCA::OpenSSL->encrypt: openca-sv failed (__ERRNO__). __ERRVAL__",
+                                      "__ERRNO__", $org_err,
+                                      "__ERRVAL__", $h));
+                $self->_debug ("encrypt: errorcode: $self->errno");
+                $self->_debug ("encrypt: errormsg:  $self->errval");
+            }
+	    unlink( $tmpfile ) if (not $out);
+	    return undef;
+	}
+
+        $self->_debug ("encrypt: returned data:\n$ret");
+	if( not $out) {
+		unlink( $tmpfile );
+                $self->_debug ("encrypt: finished successfully (return output)");
+		return $ret;
+	} else {
+                $self->_debug ("encrypt: finished successfully (return 1)");
+		return 1;
+	}
+}
+
+sub decrypt {
+
+	## Extract data from a PKCS7 structure.
+
+	my $self = shift;
+	my $keys = { @_ };
+
+	my $data    = $keys->{DATA};
+	my $datafile= $keys->{DATA_FILE};
+	$datafile = $keys->{INFILE} if (not $datafile);
+	my $out     = $keys->{OUT_FILE};
+	my $certfile= $keys->{CERT_FILE};
+	$certfile = $self->{PEM_CERT} if (not $certfile);
+	my $cert    = $keys->{CERT};
+	my $keyfile = $keys->{KEY_FILE};
+	$keyfile = $self->{KEY} if (not $keyfile);
+	my $key     = $keys->{KEY};
+	my $pwd     = ( $keys->{PWD} or $keys->{PASSWD} );
+	$pwd = $self->{PASSWD} if (not $pwd);
+	my $tmpfile = $self->{tmpDir} . "/${$}_decrypt.tmp";
+
+	my $command = $self->{decrypt} . " ";
+        if( $self->{ENGINE} ) {
+                my $init = $self->_build_engine_params(KEY_USAGE => "1");
+                $command .= " -engine $self->{ENGINE} -keyform ".$self->{KEYFORM}." $init ";
+        }
+
+	my ( $ret );
+
+	if( (not $data) and (not $datafile) ) {
+		$self->setError (7746011,
+                    $self->{gettext} ("OpenCA::OpenSSL->decrypt: No input source."));
+		return undef;
+	}
+	if( (not $cert) and (not $certfile) ) {
+		$self->setError (7746012,
+                    $self->{gettext} ("OpenCA::OpenSSL->decrypt: No certificate specified."));
+		return undef;
+	}
+	if( (not $key)  and (not $keyfile) ) {
+		$self->setError (7746012,
+                    $self->{gettext} ("OpenCA::OpenSSL->decrypt: No private key specified."));
+		return undef;
+	}
+
+	if ( not $datafile ) {
+		$datafile = $self->{tmpDir} . "/${$}_data.tmp";
+		if (not open FD, ">".$datafile) {
+			$self->setError (7746031,
+                            $self->{gettext} ("OpenCA::OpenSSL->decrypt: Cannot open datafile __FILENAME__ for writing.",
+                                              "__FILENAME__", $datafile));
+			return undef;
+		}
+		print FD $data;
+		close FD;
+	} else {
+		$data = 0;
+	}
+	if ( not $keyfile ) {
+		$keyfile = $self->{tmpDir} . "/${$}_key.tmp";
+		if (not open FD, ">".$keyfile) {
+			$self->setError (7746033,
+                            $self->{gettext} ("OpenCA::OpenSSL->decrypt: Cannot open keyfile __FILENAME__ for writing.",
+                                              "__FILENAME__", $keyfile));
+			unlink ($datafile) if ($data);
+			return undef;
+		}
+		print FD $key;
+		close FD;
+	} else {
+		$key = 0;
+	}
+	if ( not $certfile ) {
+		$certfile = $self->{tmpDir} . "/${$}_cert.tmp";
+		if (not open FD, ">".$certfile) {
+			$self->setError (7746035,
+                            $self->{gettext} ("OpenCA::OpenSSL->decrypt: Cannot open certfile __FILENAME__ for writing.",
+                                              "__FILENAME__", $certfile));
+			unlink ($datafile) if ($data);
+			unlink ($keyfile) if ($key);
+			return undef;
+		}
+		print FD $cert;
+		close FD;
+	} else {
+		$cert = 0;
+	}
+
+	$command   .= "-in $datafile ";
+	$command   .= "-out $out "            if ( $out );
+	if (not $self->{GET_PIN_CALLBACK})
+	{
+		$command   .= "-passin env:pwd " if ( $pwd );
+	}
+	$command   .= "-cert $certfile ";
+	$command   .= " -keyfile $keyfile ";
+
+	if( not $out) {
+		$command .= " >$tmpfile";
+	};
+
+        $self->_debug ("decrypt: $command");
+
+	$ENV{pwd} = "$pwd" if ( $pwd );
+	$ret =`$command`;
+	delete ($ENV{pwd});
+
+	if ( $? ) {
+		unlink( $tmpfile )  if (not $out);
+		unlink( $datafile ) if ($data);
+		unlink( $keyfile )  if ($key);
+		unlink( $certfile ) if ($cert);
+                if ($? == -1)
+                {
+	            $self->setError (7746073,
+                        $self->{gettext} ("OpenCA::OpenSSL->decrypt: openca-sv failed with errorcode -1. This usually means that the command __COMMAND__ is not present.",
+                                  "__COMMAND__", $self->{openca_sv}));
+                } elsif ($? == 32256)
+                {
+	            $self->setError (7746074,
+                        $self->{gettext} ("OpenCA::OpenSSL->decrypt: openca-sv failed with errorcode 32256. This usually means that the file permissions are wrong for the command __COMMAND__.",
+                                  "__COMMAND__", $self->{openca_sv}));
+                } elsif ($? == 32512)
+                {
+	            $self->setError (7746072,
+                        $self->{gettext} ("OpenCA::OpenSSL->decrypt: openca-sv failed with errorcode 32512. This usually means that the command openca-sv is malformed or not present (__COMMAND__).",
+                                  "__COMMAND__", $self->{openca_sv}));
+                } else {
+		    $self->setError (7746071,
+                        $self->{gettext} ("OpenCA::OpenSSL->decrypt: openca-sv failed (__ERRNO__).",
+                                          "__ERRNO__", $?));
+                }
+		return undef;
+	}
+        $self->_debug ("decrypt: openca-sv succeeded");
+	unlink( $datafile ) if ($data);
+	unlink( $keyfile )  if ($key);
+	unlink( $certfile ) if ($cert);
+
+	if( not $out ) {
+		if (not open( TMP, "<$tmpfile" )) {
+			$self->setError (7746081,
+                            $self->{gettext} ("OpenCA::OpenSSL->decrypt: Cannot open tmpfile __FILENAME__ for reading.",
+                                              "__FILENAME__", $tmpfile));
+			return undef;
+		}
+		do {
+			$ret .= <TMP>;
+		} while (not eof(TMP));
+		close(TMP);
+
+		unlink( $tmpfile );
+	}
+
+	## If we are here there have been no errors, so
+	## if $ret is empty, let us return a true value...
 	$ret = 1 if ( not $ret );
 
 	return $ret;
@@ -1694,12 +2275,16 @@ sub getCertAttribute {
 	my $keys = { @_ };
 
 	my $cert;
-	if ($keys->{INFORM} and $keys->{INFORM} =~ /DER/)
-	{
+
+	# $self->_debug("OpenCA::OpenSSL::getCertAttribute() start");
+
+	if ($keys->{INFORM} and $keys->{INFORM} =~ /DER/) {
 		$cert = OpenCA::OpenSSL::X509::_new_from_der ($keys->{DATA});
 	} else {
 		$cert = OpenCA::OpenSSL::X509::_new_from_pem ($keys->{DATA});
 	}
+
+	# $self->_debug("OpenCA::OpenSSL::getCertAttribute() got cert");
 
 	my @attribute = ();
 	if( $keys->{ATTRIBUTE_LIST} && ref($keys->{ATTRIBUTE_LIST}) ) {
@@ -1712,9 +2297,13 @@ sub getCertAttribute {
 
 	my ( $ret );
 
+	# initialize additional OIDs not present in default OPENSSL
+	$cert->init_oids;
+
 	foreach my $attribute ( @attribute ) {
 		$_ = uc $attribute;
 		my $func;
+
 		SWITCH: {
 			$func = lc $attribute;
 			if (/^NOTBEFORE$/) {$func = "notBefore"};
@@ -1722,8 +2311,12 @@ sub getCertAttribute {
 			if (/^DN$/)        {$func = "subject"};
 			if (/^HASH$/)      {$func = "subject_hash"};
 		}
+
+		# $self->_debug("OpenCA::OpenSSL::getCertAttribute() calling $func ($attribute) ");
+
 		$ret->{$attribute} = $cert->$func;
 	}
+
 	return $ret;
 }
 
@@ -1824,12 +2417,10 @@ sub pkcs7Certs {
 	my $outfile = $keys->{OUTFILE};
 	my $pkcs7   = $keys->{PKCS7};
 
-	my $command = $self->{shell} . " pkcs7 -print_certs ";
+	my $command = "pkcs7 -print_certs ";
 	my $tmpfile = $self->{tmpDir} . "/${$}_SPKAC.tmp";
 
-	## my $engine;
-	## $engine     = ( $ENV{'engine'} or $keys->{ENGINE} ) if ($keys->{USE_ENGINE});
-	my $engine     = ( $ENV{'engine'} or $keys->{ENGINE} );
+	my $engine  = $self->{ENGINE};
 
 	my $ret = "";
 	my $retVal = 0;
@@ -1838,12 +2429,12 @@ sub pkcs7Certs {
 	if( defined($pkcs7) && $pkcs7 ne "" ) {
 		$infile = $self->{tmpDir} . "/${$}_in_SPKAC.tmp";
 		if (not open( FD, ">$infile" )) {
-			print "OpenCA::OpenSSL->pkcs7Certs: cannot open infile $infile<br>\n"
-				if ($self->{DEBUG});
-			$self->setError (7744021, "OpenCA::OpenSSL->pkcs7Certs: Cannot open infile $infile for writing.");
+			$self->setError (7744021,
+                            $self->{gettext} ("OpenCA::OpenSSL->pkcs7Certs: Cannot open infile __FILENAME__ for writing.",
+                                              "__FILENAME__", $infile));
 			return undef;
 		}
-		print FD "$pkcs7\n";
+		print FD $pkcs7."\n";
 		close ( FD );
 	}
 
@@ -1858,43 +2449,37 @@ sub pkcs7Certs {
 		$command .= "-out $tmpfile ";
 	}
 
-	print "OpenCA::OpenSSL->pkcs7Certs: command=\Q$command\E<br>\n"
-		if ($self->{DEBUG});
-	$ret = `$command 2>&1`;
-	if( $? > 0 ) {
-		$self->setError (7744071, "OpenCA::OpenSSL->pkcs7Certs: OpenSSL failed (".$?.": ".$ret.").");
-		if ($self->{DEBUG}) {
-			print "OpenCA::OpenSSL->pkcs7Certs: error detected<br>\n";
-			print "OpenCA::OpenSSL->pkcs7Certs: errno=".$self->errno()."<br>\n";
-			print "OpenCA::OpenSSL->pkcs7Certs: errmsg=".$self->errval()."<br>\n";
-		}
+        $self->_debug ("pkcs7Certs: command=$command");
+	$ret = $self->_execute_command(COMMAND => $command);
+	if( not $ret ) {
+		$self->setError (7744071,
+                    $self->{gettext} ("OpenCA::OpenSSL->pkcs7Certs: OpenSSL failed (__ERRNO__). __ERRVAL__",
+                                      "__ERRNO__", $self->errno,
+                                      "__ERRVAL__", $self->errval));
+		unlink $infile if( defined($pkcs7) && $pkcs7 ne "");
+		unlink $tmpfile if (not (defined($outfile)) or $outfile eq "");
+		return undef;
 	}
 
 	## Unlink the infile if it was temporary
 	unlink $infile if( defined($pkcs7) && $pkcs7 ne "");
 
 	## Get the output
-	if (not open( TMP, "$tmpfile" )) {
-		print "OpenCA::OpenSSL->pkcs7Certs: cannot open tmpfile $tmpfile<br>\n"
-			if ($self->{DEBUG});
-		$self->setError (7744081, "OpenCA::OpenSSL->pkcs7Certs: Cannot open tmpfile $tmpfile for reading.");
+	if (not open( TMP, $tmpfile )) {
+		$self->setError (7744081,
+                    $self->{gettext} ("OpenCA::OpenSSL->pkcs7Certs: Cannot open tmpfile __FILENAME__ for reading.",
+                                      "__FILENAME__", $tmpfile));
 		return undef;
 	}
+        $ret = "";
 	while ( $tmp = <TMP> ) {
 		$ret .= $tmp;
 	}
 	close( TMP );
 	unlink $tmpfile if (not (defined($outfile)) or $outfile eq "");
 
-	if ( $self->errno() != 0 ) {
-		print "OpenCA::OpenSSL->pkcs7Certs: return undef because of an error<br>\n"
-			if ($self->{DEBUG});
-		return undef;
-	} else {
-		print "OpenCA::OpenSSL->pkcs7Certs: finished successfully<br>\n"
-			if ($self->{DEBUG});
-		return $ret;
-	}
+        $self->_debug ("pkcs7Certs: finished successfully");
+        return $ret;
 }
 
 sub updateDB {
@@ -1905,13 +2490,13 @@ sub updateDB {
 	my $cakey    = $keys->{CAKEY};
 	$cakey = $self->{KEY} if (not $cakey);
 	my $cacert   = $keys->{CACERT};
-	$cacert = $self->{CERT} if (not $cacert);
+	$cacert = $self->{PEM_CERT} if (not $cacert);
 	my $passwd   = $keys->{PASSWD};
 	$passwd = $self->{PASSWD} if (not $passwd);
 	my $outfile  = $keys->{OUTFILE};
 
 	my ( $ret, $tmp );
-	my $command = "$self->{shell} ca -updatedb ";
+	my $command = "ca -updatedb ";
 
 	$command .= "-config " . $self->{cnf}. " " if ( defined($self->{'cnf'}) && $self->{cnf} ne "" );
 	$command .= "-keyfile $cakey " if( defined($cakey) && $cakey ne "" );
@@ -1919,17 +2504,22 @@ sub updateDB {
 	$command .= "-cert $cacert " if ( defined($cacert) && $cacert ne "" );
 
 	$ENV{'pwd'} = "$passwd";
-	$ret = `$command`;
+	$ret = $self->_execute_command (COMMAND => $command);
 	delete( $ENV{'pwd'} );
 
-	if( $? != 0) {
-		$self->setError (7771071, "OpenCA::OpenSSL->updateDB: OpenSSL failed (".$?.").");
+	if( not $ret ) {
+		$self->setError (7771071,
+                    $self->{gettext} ("OpenCA::OpenSSL->updateDB: OpenSSL failed (__ERRNO__). __ERRVAL__",
+                                      "__ERRNO__", $self->errno,
+                                      "__ERRVAL__", $self->errval));
 		return undef;
 	}
 
 	if( defined($outfile) && $outfile ne "" ) {
 		if (not open( FD, ">$outfile" )) {
-			$self->setError (7771081, "OpenCA::OpenSSL->updateDB: Cannot open outfile $outfile for writing.");
+			$self->setError (7771081,
+                            $self->{gettext} ("OpenCA::OpenSSL->updateDB: Cannot open outfile __FILENAME__ for writing.",
+                                              "__FILENAME__", $outfile));
 			return undef;
 		}
 		print FD "$ret";
@@ -1953,7 +2543,6 @@ sub getSMIME {
 	## OUTFILE      => $outfile
 	## DATA         => $message
 	## MESSAGE      => $message (higher priority)
-	## ENGINE       => openssl engine
 	## TO           => $to
 	## FROM         => $from
 	## SUBJECT      => $subject
@@ -1965,7 +2554,7 @@ sub getSMIME {
 	my $encrypt     = $keys->{ENCRYPT};
 	my $sign        = $keys->{SIGN};
 	my $cert        = $keys->{CERT};
-	$cert = $self->{CERT} if (not $cert);
+	$cert = $self->{PEM_CERT} if (not $cert);
 	my $key         = $keys->{KEY};
 	$key = $self->{KEY} if (not $key);
 	my $enc_cert    = $keys->{ENCRYPT_CERT};
@@ -1977,31 +2566,46 @@ sub getSMIME {
 	my $message     = $keys->{DATA};
 	$message        = $keys->{MESSAGE} if ($keys->{MESSAGE});
 	my $to          = $keys->{TO};
+	my $cc          = $keys->{CC};
 	my $from        = $keys->{FROM};
 	my $subject     = $keys->{SUBJECT};
 
-	## my $engine;
-	## $engine     = ( $ENV{'engine'} or $keys->{ENGINE} ) if ($keys->{USE_ENGINE});
-	my $engine     = ( $ENV{'engine'} or $keys->{ENGINE} );
+	my $engine      = $self->{ENGINE};
 
 	my ( $ret, $tmp, $tmpfile );
 
 	## smime can only handle file and not stdin
 	if ($message) {
 		$infile = $self->{tmpDir} . "/${$}_data.msg";
-		if ($self->{DEBUG}) {
-			print "OpenCA::OpenSSL->dataConvert: create temporary infile $infile<br>\n";
-			print "OpenCA::OpenSSL->dataConvert: the data is like follows<br>\n";
-			print "$message<br>\n";
-		}
+                $self->_debug ("getSMIME: create temporary infile $infile");
+                $self->_debug ("getSMIME: the data is like follows\n$message");
 		if (not  open FD, ">".$infile) {
-			print "OpenCA::OpenSSL->getSMIME: failed to open temporary infile $infile<br<\n"
-				if ($self->{DEBUG});
 			$self->setError (7752021,
-					"OpenCA::OpenSSL->getSMIME: Cannot write message to tmpfile $infile.");
+			    $self->{gettext} ("OpenCA::OpenSSL->getSMIME: Cannot write message to tmpfile __FILENAME__.",
+                                              "__FILENAME__", $infile));
 			return undef;
 		}
-		print FD $message;
+		print FD "From: $from\n";
+		print FD "To: $to\n";
+		foreach my $address (@{$cc})
+		{
+			print FD "Cc: $address\n";
+		}
+		print FD "Subject: $subject\n";
+		my $encoding = setlocale (LC_MESSAGES);
+
+		if ($encoding ne "C") {
+                  $encoding =~ s/^.*\.//; ## remove language
+                } else {
+                  $encoding = 'UTF-8';
+                }
+                $encoding =~ s/(UTF|ISO|EUC)([^-]{1})/$1-$2/i;  ## on FreeBSD "locale" returns charset names
+                                                                ## which do not comply with IANA standard for
+                                                                ## MIME
+                
+	        print FD "Content-Type: text/plain; charset=$encoding; format=flowed\n".
+                         "Content-Transfer-Encoding: 8bit\n";
+		print FD "\n".$message;
 		close FD;
 	} else {
 		$message = 0;
@@ -2021,78 +2625,99 @@ sub getSMIME {
 	if ($enc_cert)
 	{
 		$enc_x509 = OpenCA::X509->new (
-		                SHELL  => $self,
-		                INFILE => $enc_cert);
+		                SHELL   => $self,
+                                GETTEXT => $self->{gettext},
+		                INFILE  => $enc_cert);
 		if (not $enc_x509)
 		{
 			unlink $infile if ($message);
 			return $self->setError ($OpenCA::X509::errno, $OpenCA::X509::errval);
 		}
 	}
-	if ($sign_cert)
-	{
+        $self->_debug ("getSMIME: enccert object ready");
+	if ($sign_cert) {
 		$sign_x509 = OpenCA::X509->new (
-		                SHELL  => $self,
-		                INFILE => $sign_cert);
-		if (not $sign_x509)
-		{
+		                SHELL   => $self,
+                                GETTEXT => $self->{gettext},
+		                INFILE  => $sign_cert);
+		if (not $sign_x509) {
 			unlink $infile if ($message);
 			return $self->setError ($OpenCA::X509::errno, $OpenCA::X509::errval);
 		}
 	}
-	
+        $self->_debug ("getSMIME: signcert object ready");
 
 	## use OpenCA::OpenSSL::SMIME
 	## this is only a wrapper for old code !!!
 
 	## decryption
 	my $smime = OpenCA::OpenSSL::SMIME->new(
-	                         INFILE => $infile,
-	                         SHELL => $self,
-	                         ENGINE => $engine
+	                         INFILE  => $infile,
+	                         SHELL   => $self,
+	                         ENGINE  => $engine,
+                                 KEYFORM => $self->{KEYFORM},
+                                 GETTEXT => $self->{gettext},
+                                 TMPDIR  => $self->{tmpDir},
+                                 DEBUG   => $self->{DEBUG}
+                                 # DEBUG   => 1
 	                         );
-	if (not $smime)
-	{
+	if (not $smime) {
+
+                $self->_debug ("getSMIME: smime object failed");
+
 		unlink $infile if ($message);
-		return $self->setError ($OpenCA::OpenSSL::SMIME->errno, $OpenCA::OpenSSL::SMIME->err);
+		return $self->setError ($OpenCA::OpenSSL::SMIME::errno, 
+						$OpenCA::OpenSSL::SMIME::err);
 	}
+
+        $self->_debug ("getSMIME: smime object ready");
+
 	if ($decrypt) {
 		open(KEYF, '<', $key) or return;
 		if (not $smime->decrypt(
 		            CERTIFICATE  => $enc_x509,
 		            KEY_PASSWORD => $passwd,
-		            PRIVATE_KEY  => \*KEYF))
-		{
+		            PRIVATE_KEY  => \*KEYF)) {
 			close (KEYF);
 			unlink $infile if ($message);
-			return $self->setError ($smime->errno, $smime->err);
+			return $self->setError ($smime->errno, $smime->errval);
 		}
 		close (KEYF);
 	} else {
 		## 1. signing
-		if ($sign) {
+		if ( $sign eq "1" ) {
 			open(KEYF, '<', $key) or return;
 			if (not $smime->sign(
 			            CERTIFICATE  => $sign_x509,
 			            KEY_PASSWORD => $passwd,
-			            PRIVATE_KEY  => \*KEYF))
-			{
+			            PRIVATE_KEY  => \*KEYF)) {
 				close (KEYF);
+
+				$self->_debug("ERROR::Can not sign SMIME (" .
+					$smime->errno . "::" .
+						$smime->errval );
+
 				unlink $infile if ($message);
-				return $self->setError ($smime->errno, $smime->err);
+
+				return $self->setError ($smime->errno, $smime->errval);
 			}
 			close (KEYF);
 		}
 		if ($encrypt) {
-			if (not $smime->encrypt(CERTIFICATE  => $sign_x509))
+			if (not $smime->encrypt(CERTIFICATE  => $enc_x509))
 			{
 				unlink $infile if ($message);
-				return $self->setError ($smime->errno, $smime->err);
+				return $self->setError ($smime->errno, $smime->errval);
 			}
 		}
 	}
 
+
+        $self->_debug ("getSMIME: final steps ( $outfile / $smime )");
+
 	unlink $infile if ($message);
+
+        $self->_debug ("getSMIME: return data :: " . $smime->get_mime );
 
 	## if the caller want a file then we can finish
 	if( defined($outfile) && $outfile ne "" ) {
@@ -2102,10 +2727,12 @@ sub getSMIME {
 		return 1;
 	}
 
-	print "OpenCA::OpenSSL: getSMIME: return data<br>\n"
-		if ($self->{DEBUG});
-
-	return $smime->get_mime->stringify;
+	if( defined ($smime) and defined($smime->get_mime)
+				and defined($smime->get_mime->stringify) ) {
+		return $smime->get_mime->stringify
+	} else {
+		return $message;
+	}
 }
 
 sub getPIN {
@@ -2113,7 +2740,6 @@ sub getPIN {
 	## PIN_LENGTH    => $pin_length
 	## RANDOM_LENGTH => $random_length
 	## LENGTH	 => $pin_length
-	## ENGINE        => openssl engine
 
 	my $self = shift;
 	my $keys = { @_ };
@@ -2121,14 +2747,19 @@ sub getPIN {
 	my $pin_length = $keys->{LENGTH};
 	$pin_length    = $keys->{PIN_LENGTH} if (defined $keys->{PIN_LENGTH});
 	my $length     = $keys->{RANDOM_LENGTH};
+	my $hex	       = $keys->{HEX};
 
-	## my $engine;
-	## $engine     = ( $ENV{'engine'} or $keys->{ENGINE} ) if ($keys->{USE_ENGINE});
-	my $engine     = ( $ENV{'engine'} or $keys->{ENGINE} );
+	my $engine     = $self->{ENGINE};
 
 	my ( $ret, $tmp, $tmpfile );
 
-	my $command = "$self->{shell} rand -base64 ";
+	my $command = " rand ";
+	if ( $hex ) {
+		$command .= " -hex ";
+	} else {
+		$command .= " -base64 ";
+	}
+
         if( $engine ) {
           $command .= " -engine $engine ";
         }
@@ -2141,34 +2772,37 @@ sub getPIN {
 	}
 
 	## create the PIN
-	my $pin;
-	if (not open (FD, "$command|")) {
-		$self->setError (7753071, "OpenCA::OpenSSL->getPIN: Cannot open pipe from OpenSSL.");
-		return undef;
-	}
-	if ($pin_length) {
-	  ## enforce the PIN-length
-	  ## SECURITY ADVICE: it is more secure to only set the
-	  ##                  number of randombytes
-	  read FD, $pin, $pin_length;
-	} else {
-	  ## 2*$length is enough to encode $length randombytes in base64
-	  read FD, $pin, 2*$length;
-	}
-	close FD;
+	my $pin = $self->_execute_command (COMMAND => $command, 
+							HIDE_OUTPUT => 1);
 
-	if ($? != 0) {
-		$self->setError (7753073, "OpenCA::OpenSSL->getPIN: OpenSSL failed (".$?.").");
+	if (not $pin) {
+		$self->setError (7753071,
+                    $self->{gettext} ("OpenCA::OpenSSL->getPIN: OpenSSL failed (__ERRNO). __ERRVAL__",
+                                      "__ERRNO__", $self->errno,
+                                      "__ERRVAL__", $self->errval));
 		return undef;
 	}
 
 	## remove trailing newline
-	$pin =~ s/\n//g;
+	$pin =~ s/\n//gs;
+	$pin =~ s/=*$//gs;
+
+	if ($pin_length) {
+	  ## enforce the PIN-length
+	  ## SECURITY ADVICE: it is more secure to only set the
+	  ##                  number of randombytes
+          $pin = substr ($pin, 0, $pin_length);
+	} else {
+	  ## 2*$length is enough to encode $length randombytes in base64
+          my $hl = 2*$length;
+          $pin = substr ($pin, 0, $hl);
+	}
 
 	if ($pin) {
 		return $pin;
 	} else {
-		$self->setError (7753075, "OpenCA::OpenSSL->getPIN: PIN is empty.");
+		$self->setError (7753075,
+                    $self->{gettext} ("OpenCA::OpenSSL->getPIN: PIN is empty."));
 		return undef;
 	}
 
@@ -2178,12 +2812,14 @@ sub getOpenSSLDate {
 	my $self = shift;
 
 	if (not defined $_[0]) {
-		$self->setError (7754011, "OpenCA::OpenSSL->getOpenSSLDate: No date specified.");
+		$self->setError (7754011,
+                    $self->{gettext} ("OpenCA::OpenSSL->getOpenSSLDate: No date specified."));
 		return undef;
 	}
 	my $date = $self->getNumericDate ( $_[0] );
 	if (not defined $date) {
-		$self->{errval} = "OpenCA::OpenSSL->getOpenSSLDate: Errorcode 7754021:\n".$self->{errval};
+		$self->{errval} = $self->{gettext} ("OpenCA::OpenSSL->getOpenSSLDate: Errorcode 7754021: __ERRVAL__",
+                                                    "__ERRVAL__", $self->{errval});
 		return undef;
 	}
 
@@ -2198,18 +2834,23 @@ sub getOpenSSLDate {
 
 sub getNumericDate {
 	my $self = shift;
-
-	if (not defined $_[0]) {
-		$self->setError (7755011, "OpenCA::OpenSSL->getNumericDate: No argument specified.");
-		return undef;
-	}
-	my $date = $_[0];
-	if (not $date) {
-		$self->setError (7755012, "OpenCA::OpenSSL->getNumericDate: No date specified.");
-		return undef;
-	}
 	my %help;
 	my $new_date;
+
+	my $date = $_[0];
+
+	# if (not defined $_[0]) {
+		# $self->setError (7755011,
+                  #   $self->{gettext} ("OpenCA::OpenSSL->getNumericDate: No argument specified."));
+		# return undef;
+	# }
+	if (not $date) {
+		$date = gmtime();
+
+		# $self->setError (7755012,
+                #     $self->{gettext} ("OpenCA::OpenSSL->getNumericDate: No date specified."));
+		# return undef;
+	}
 
 	## remove leading days like SUN or MON
 	if ( $date =~ /^\s*[^\s]+\s+(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)/i ) {
@@ -2256,8 +2897,13 @@ sub getNumericDate {
 		## december
 		$help {MONTH} = "12";
 	} else {
+		my @call = caller ( 1 );
 		## return illegal
-		$self->setError (7755022, "OpenCA::OpenSSL->getNumericDate: Illelgal month.");
+		$self->setError (7755022,
+                    $self->{gettext} ("OpenCA::OpenSSL->getNumericDate: Illegal month."));
+		print STDERR $call[2] . "::" . $call[1] . "->" .
+			"[orig was $date]\n";
+
 		return undef;
 	}
 
@@ -2289,6 +2935,321 @@ sub getNumericDate {
 
 	return $new_date; 
 
+}
+
+sub getNumericDateDays {
+	my $self = shift;
+	my $date = shift;
+	my $tmpVal = undef;
+	my @monVals = ( 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 );
+	my $counter = 0;
+	my $ret = 0;
+
+	if( not $date ) {
+		$date = gmtime();
+	}
+
+	$date = $self->getNumericDate ( $date ) if ( $date =~ /[a-zA-Z]+/ );
+
+	# Years * 365
+	$tmpVal = substr ( $date, 0, 4) * 365;
+	$ret += $tmpVal;
+
+	# Months
+	$tmpVal = substr ( $date, 4, 2 );
+	for ( my $counter = 1; $counter < $tmpVal ; $counter++ ) {
+		$ret += $monVals[$counter - 1];
+	}
+
+	$tmpVal = substr ( $date, 6, 2 );
+	$ret += $tmpVal;
+
+	return $ret;
+}
+
+##############################################################
+##             OpenSSL execution environment                ##
+##                        BEGIN                             ##
+##############################################################
+
+sub _start_shell
+{
+    my $self = shift;
+    $self->_debug ("_start_shell: try to start shell");
+    my $keys = { @_ };
+
+    return 1 if ($self->{OPENSSL});
+
+    my $open = "| ".$self->{shell}.
+               " 1>$self->{tmpDir}/${$}_stdout.log".
+               " 2>$self->{tmpDir}/${$}_stderr.log";
+    $self->_debug ("_start_shell: $open");
+    if (not open $self->{OPENSSL}, $open)
+    {
+        my $msg = $self->{gettext} ("Cannot start OpenSSL shell. (__ERRVAL__)",
+                                    "__ERRVAL__", $!);
+        $self->setError (7777030, $msg);
+        return undef;
+    }
+    $self->_debug ("_start_shell: shell started");
+
+    if ($self->{ENGINE} and
+        (
+         exists $self->{PRE_ENGINE} or
+         exists $self->{POST_ENGINE}
+        )
+       )
+    {
+        $self->_debug ("_start_shell: initializing engine");
+        my $command;
+        if ($self->{DYNAMIC_ENGINE}) {
+            $command = "engine dynamic -pre ID:".$self->{ENGINE};
+        } else {
+            $command = "engine ".$self->{ENGINE};
+        }
+        $command .= $self->_build_engine_params(KEY_USAGE => $keys->{KEY_USAGE});
+        $command .= "\n";
+        if (not print {$self->{OPENSSL}} $command)
+        {
+            my $msg = $self->{gettext} ("Cannot write to the OpenSSL shell. (__ERRVAL__)",
+                                        "__ERRVAL__", $!);
+            $self->setError (7777040, $msg);
+            return undef;
+        }
+
+        $self->_debug ("_start_shell: engine intialized");
+    }
+
+    return 1;
+}
+
+sub _stop_shell
+{
+    my $self = shift;
+    $self->_debug ("_stop_shell: try to stop shell");
+
+    return 1 if (not $self->{OPENSSL});
+
+    print {$self->{OPENSSL}} "exit\n";
+    close $self->{OPENSSL};
+    $self->{OPENSSL} = undef;
+
+    return 1;
+}
+
+sub _execute_command
+{
+    my $self = shift;
+    $self->_debug ("_execute_command: entering function");
+    my $keys = { @_ };
+
+    ## initialize openssl (with engine if necessary)
+
+    return undef if (not $self->_start_shell(KEY_USAGE => $keys->{KEY_USAGE}));
+
+    ## run command
+
+    my $command = $keys->{COMMAND}; 
+    my $input  = undef;
+    $input   = $keys->{INPUT} if (exists $keys->{INPUT});
+    $command =~ s/\n*$//;
+    $command .= "\n";
+    $self->_debug ("_execute_command: $command");
+    if (not print {$self->{OPENSSL}} $command)
+    {
+        my $msg = $self->{gettext} ("Cannot write to the OpenSSL shell. (__ERRVAL__)",
+                                    "__ERRVAL__", $!);
+        $self->setError (7777060, $msg);
+        return undef;
+    }
+    $self->_debug ("_execute_command: executed");
+
+    ## if key is used and pin callback is set then use it
+ 
+    if ($keys->{KEY_USAGE} and
+        $self->{PIN_CALLBACK} and
+        $self->{CALLBACK_HANDLER})
+    {
+        $self->_debug ("_execute_command: executing pin callback");
+        $self->{PIN_CALLBACK} ($self->{CALLBACK_HANDLER});
+        $self->_debug ("_execute_command: pin callback executed");
+    }
+
+    ## send the input
+
+    if ($input and not print {$self->{OPENSSL}} $input."\x00")
+    {
+        $self->_debug ("_execute_command: write input data");
+        my $msg = $self->{gettext} ("Cannot write to the OpenSSL shell. (__ERRVAL__)",
+                                    "__ERRVAL__", $!);
+        $self->setError (7777065, $msg);
+        return undef;
+    }
+    $self->_debug ("_execute_command: command executed - stopping shell");
+    return undef if (not $self->_stop_shell());
+
+    ## check for errors
+
+    $self->_debug ("_execute_command: check for error");
+
+    if (-e "$self->{tmpDir}/${$}_stderr.log")
+    {
+        $self->_debug ("_execute_command: detected error log");
+        ## there was an error
+        my $ret = "";
+        if (open FD, "$self->{tmpDir}/${$}_stderr.log")
+        {
+            while( my $tmp = <FD> ) {
+                $ret .= $tmp;
+            }
+            close(FD);
+        }
+        $self->_debug ("_execute_command: stderr: $ret");
+        if ($self->{ENGINE} and
+            (
+             exists $self->{PRE_ENGINE} or
+             exists $self->{POST_ENGINE}
+            ) and
+            $self->{STDERR_CALLBACK} and
+            $self->{CALLBACK_HANDLER})
+        {
+            $self->_debug ("_execute_command: executing stderr callback");
+            $ret = $self->{STDERR_CALLBACK} ($self->{CALLBACK_HANDLER}, $ret);
+            $self->_debug ("_execute_command: stderr callback executed");
+        }
+        unlink ("$self->{tmpDir}/${$}_stderr.log");
+        if ($ret =~ /error/i)
+        {
+            unlink ("$self->{tmpDir}/${$}_stdout.log");
+            $self->setError (7777067, $ret);
+            return undef;
+        }
+        
+    }
+
+    ## load the output
+
+    my $ret = 1;
+    if (-e "$self->{tmpDir}/${$}_stdout.log" and
+        open FD, "$self->{tmpDir}/${$}_stdout.log")
+    {
+        ## there was an output
+        $ret = "";
+        while( my $tmp = <FD> ) {
+            $ret .= $tmp;
+        }
+        close(FD);
+        if ($self->{ENGINE} and
+            (
+             exists $self->{PRE_ENGINE} or
+             exists $self->{POST_ENGINE}
+            ) and
+            $self->{STDOUT_CALLBACK} and
+            $self->{CALLBACK_HANDLER})
+        {
+            $self->_debug ("_execute_command: executing stdout callback");
+            $ret = $self->{STDOUT_CALLBACK} ($self->{CALLBACK_HANDLER}, $ret);
+            $self->_debug ("_execute_command: stdout callback executed");
+        }
+        $ret =~ s/^(OpenSSL>\s)*//s;
+        $ret =~ s/OpenSSL>\s$//s;
+        $ret = 1 if ($ret eq "");
+    }
+    unlink ("$self->{tmpDir}/${$}_stdout.log");
+
+    my $msg = $ret;
+    $msg = "<NOT LOGGED>" if ($keys->{HIDE_OUTPUT});
+
+    $self->_debug ("_execute_command: leaving successful (return: $msg)");
+    return $ret;
+}
+
+sub _build_engine_params
+{
+    my $self = shift;
+    my $keys = { @_ };
+
+    my $command = "";
+
+    ## set the pre init commands for the engine
+
+    if (exists $self->{PRE_ENGINE})
+    {
+        if (ref $self->{PRE_ENGINE})
+        {
+            foreach my $item (@{$self->{PRE_ENGINE}})
+            {
+                $command .= " -pre $item";
+            }
+        } else
+        {
+            $command .= " -pre ".$self->{PRE_ENGINE};
+        }
+    }
+
+    ## set the post init commands for the engine
+
+    if (exists $self->{POST_ENGINE})
+    {
+        if (ref $self->{POST_ENGINE})
+        {
+            foreach my $item (@{$self->{POST_ENGINE}})
+            {
+                $command .= " -post $item";
+            }
+        } else
+        {
+            $command .= " -post ".$self->{POST_ENGINE};
+        }
+    }
+
+    $self->_debug ("_build_engine_params: $command");
+
+    ## set the pin if there is no pin callback for the engine
+    ## this must be present after -pre SO_PATH:... because
+    ## otherwise PIN is executed on
+    ## the original pkcs11 engine for example which is from Bull and does
+    ## not support PINs like OpenSC
+
+    if ($keys->{KEY_USAGE} and
+        $self->{GET_PIN_CALLBACK} and
+        $self->{CALLBACK_HANDLER}
+       )
+    {
+        $self->_debug ("_build_engine_params: GET_PIN_CALLBACK used");
+        $command .= " ".$self->{GET_PIN_CALLBACK} ($self->{CALLBACK_HANDLER});
+    } else {
+        $self->_debug ("_build_engine_params: GET_PIN_CALLBACK not present or not used");
+    }
+
+    return $command;
+}
+
+##############################################################
+##                         END                              ##
+##             OpenSSL execution environment                ##
+##############################################################
+
+sub _debug
+{
+    my $self = shift;
+
+    return 1 if (not $self->{DEBUG});
+
+    my $text = join (" ", @_);
+    $text =~ s/PIN:[^\s]*/PIN:ERASING_FOR_SECURITY/g;
+    $text =~ s/-----BEGIN RSA PRIVATE KEY.*?END RSA PRIVATE KEY-----/RSA PRIVATE KEY ERASED FROM OUTPUT/gs;
+
+    print STDERR "OpenCA::OpenSSL->$text\n";
+
+    return 1;
+}
+
+sub DESTROY
+{
+    my $self = shift;
+
+    $self->_stop_shell();
 }
 
 ################################################################################

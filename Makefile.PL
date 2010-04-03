@@ -1,14 +1,36 @@
 use ExtUtils::MakeMaker;
 # See lib/ExtUtils/MakeMaker.pm for details of how to influence
 # the contents of the Makefile that is written.
-WriteMakefile(
-    'NAME'          => 'OpenCA::OpenSSL',
-    'VERSION_FROM'  => 'OpenSSL.pm', # finds $VERSION
-#    'MAN3PODS'      => {'OpenSSL.pod'},
-    'PREREQ_PM'     => {'X500::DN' => '0.27'},
-    'LIBS'		=> ["-L$ENV{OPENSSL_PREFIX}/lib -lcrypto"],
-    'INC'		=> "-I. -I$ENV{OPENSSL_PREFIX}/include",
-);
+
+my $uname=`uname`;
+my $params=undef;
+
+if ( $uname =~ /SunOS/i ) {
+	# $params->{OPTIMIZE} = " ";
+	# $params->{CCCDLFLAGS} = " -L$ENV{OPENSSL_PREFIX}/lib ";
+	# $params->{OTHERLDFLAGS} = "-R${OPENSSL_PREFIX}/lib";
+}
+
+$params->{NAME} = "OpenCA::OpenSSL";
+$params->{VERSION_FROM} = "OpenSSL.pm";
+$params->{LIBS} = ["-L$ENV{OPENSSL_PREFIX}/lib -lcrypto -lssl"];
+$params->{LDFLAGS} = "-L$ENV{OPENSSL_PREFIX}/lib -lcrypto -lssl";
+$params->{PREREQ_PM} = {'X500::DN' => '0.27'};
+$params->{INC} = "-I. -I$ENV{OPENSSL_PREFIX}/include";
+
+# $params->{EXTRALIBS} = "-L$ENV{OPENSSL_PREFIX}/lib -lcrypto -lssl";
+# $params->{LDLOADLIBS} = "-L$ENV{OPENSSL_PREFIX}/lib -lcrypto -lssl";
+# $params->{LD_RUN_PATH} = "$ENV{OPENSSL_PREFIX}/lib";
+
+WriteMakefile ( %{ $params } );
+
+# WriteMakefile(
+#     'NAME'		=> 'OpenCA::OpenSSL',
+#     'VERSION_FROM'	=> 'OpenSSL.pm', # finds $VERSION
+#     'LIBS'		=> ["-L$ENV{OPENSSL_PREFIX}/lib -lcrypto -lssl"],
+#     'PREREQ_PM'		=> {'X500::DN' => '0.27'},
+#     'INC'		=> "-I. -I$ENV{OPENSSL_PREFIX}/include"
+# );
 
 if  (eval {require ExtUtils::Constant; 1}) {
   # If you edit these definitions to change the constants used by this module,

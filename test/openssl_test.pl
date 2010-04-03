@@ -49,7 +49,7 @@ print "CRL Digest ... \n";
 print "    * MD5 : ";
 print $openssl->getDigest( DATA=>$crl, ALGORITHM=>md5 ) . "\n";
 print "    * SHA1 : ";
-print $openssl->getDigest( DATA=>$crl, ALGORITHM=>sha1 ) . "\n";
+print $openssl->getDigest( DATA=>$crl, ALGORITHM=>sha256 ) . "\n";
 
 print $openssl->verify( SIGNATURE_FILE=>"sig", CA_CERT=>"cert.pem",
 			VERBOSE=>"1" );

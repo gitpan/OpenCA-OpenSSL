@@ -44,23 +44,23 @@ $signature =
 
 $extensions =
 "    X509v3 Private Key Usage Period: \n".
-"            Not Before: May  8 07:38:04 2002 GMT, Not After: May  8 08:08:04 2004 GMT\n".
+"        Not Before: May  8 07:38:04 2002 GMT, Not After: May  8 08:08:04 2004 GMT\n".
 "    X509v3 Key Usage: \n".
-"            Digital Signature, Key Encipherment\n".
+"        Digital Signature, Key Encipherment\n".
 "    Netscape Cert Type: \n".
-"            SSL Client, S/MIME\n".
+"        SSL Client, S/MIME\n".
 "    X509v3 Subject Alternative Name: \n".
-"            email:julio.sanchez\@wanadoo.es, DirName:/1.3.6.1.4.1.5734.1.4=01895525a/1.3.6.1.4.1.5734.1.3=fernandez/1.3.6.1.4.1.5734.1.2=sanchez/1.3.6.1.4.1.5734.1.1=julio\n".
+"        email:julio.sanchez\@wanadoo.es, DirName:/1.3.6.1.4.1.5734.1.4=01895525a/1.3.6.1.4.1.5734.1.3=fernandez/1.3.6.1.4.1.5734.1.2=sanchez/1.3.6.1.4.1.5734.1.1=julio\n".
 "    X509v3 CRL Distribution Points: \n".
-"            DirName:/C=ES/O=FNMT/OU=FNMT Clase 2 CA/CN=CRL538\n".
+"        DirName:/C=ES/O=FNMT/OU=FNMT Clase 2 CA/CN=CRL538\n".
 "\n".
 "    X509v3 Authority Key Identifier: \n".
-"            keyid:40:9A:76:44:97:74:07:C4:AC:14:CB:1E:8D:4F:3A:45:7C:30:D7:61\n".
+"        keyid:40:9A:76:44:97:74:07:C4:AC:14:CB:1E:8D:4F:3A:45:7C:30:D7:61\n".
 "\n".
 "    X509v3 Subject Key Identifier: \n".
-"            EB:26:97:71:F9:0A:62:B2:1C:F2:F8:9E:09:5C:2A:62:1B:72:44:64\n".
+"        EB:26:97:71:F9:0A:62:B2:1C:F2:F8:9E:09:5C:2A:62:1B:72:44:64\n".
 "    X509v3 Basic Constraints: \n".
-"            CA:FALSE\n".
+"        CA:FALSE\n".
 "    1.2.840.113533.7.65.0: \n".
 "        0\n".
 "..V5.0....\n";
@@ -92,6 +92,12 @@ ok ( $intcert->pubkey, $pubkey);
 
 ## 20
 ok ( $intcert->extensions, $extensions);
+open FD, ">t3_20.org";
+print FD $extensions;
+close FD;
+open FD, ">t3_20.new";
+print FD $intcert->extensions;
+close FD;
 
 # 21-22
 ok ( $intcert->signature_algorithm, 'sha1WithRSAEncryption' );
